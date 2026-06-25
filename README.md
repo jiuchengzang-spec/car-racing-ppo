@@ -98,11 +98,36 @@ python smoke_test.py
 
 ## Train an agent
 
+A self-contained **PyTorch PPO** — no stable-baselines3, no TensorBoard, just
+`numpy + gymnasium + torch`. Training uses **curriculum learning** by default: it
+starts on easy *flowing* circuits and auto-advances to *balanced* then tight
+*technical* ones once the agent reliably finishes laps. Progress prints to the
+console each update (add `--csv run.csv` to also log a row per update for plots).
+
 ```bash
-python train.py --timesteps 1_000_000          # PPO, 8 parallel envs
-python train.py --randomize-track              # generalise across circuits
-python enjoy.py --model ppo_racing             # watch it drive
+pip install torch                              # the only extra dep for training
+python train.py --timesteps 2_000_000          # PPO, 8 parallel envs, curriculum on
+python train.py --no-curriculum --randomize-track   # one randomised setting instead
+python enjoy.py --model ppo_racing.pt          # watch it drive
 ```
+
+Checkpoints land in `./checkpoints` (`ppo_racing_<steps>.pt` plus a best-so-far
+`ppo_racing_best.pt`); the final policy is written to `--out` (default
+`ppo_racing.pt`).
+
+**Optional — Weights & Biases.** Console/CSV logging needs nothing extra, but you
+can mirror every update to [W&B](https://wandb.ai) with `--wandb` (`wandb` is only
+imported when you pass it):
+
+```bash
+pip install wandb && wandb login
+python train.py --wandb                         # logs to the preset entity/project
+python train.py --wandb --wandb-project my-proj --wandb-name run1   # override
+```
+
+It logs episode return, length, lap rate, the PPO losses, KL, FPS and the current
+curriculum stage. Defaults: entity `jiucheng-zang-venuiti-solutions`, project
+`racing-car-ppo training`.
 
 ## The RL problem
 
@@ -113,10 +138,16 @@ python enjoy.py --model ppo_racing             # watch it drive
   crutch in the observation.
 - **Action** (`Box`): `[steer, throttle]`, each in `[-1, 1]` (throttle negative =
   brake/reverse).
-- **Reward**: metres of forward progress along the track each step, minus a small
-  time cost (faster is better), a large penalty + episode end for leaving the
-  track, and a bonus for completing the lap. (The human game keeps rolling
-  through laps and off-tracks; only the RL episode resets on them.)
+- **Reward**: forward progress along the track each step (the dense signal),
+  minus a small time cost (faster is better) and small **safety + comfort**
+  shaping — stay near the centreline, point down the track, and don't saw at the
+  controls (anti-weave) — plus a large penalty + episode end for leaving the
+  track and a bonus for completing the lap. The shaping weights are all small
+  next to progress, so the optimum stays "fast and clean", not "slow and tidy"
+  (and there's no survival bonus to farm by circling). The weights are tunable
+  `RacingEnv` args (`progress_w`, `cte_w`, `heading_w`, `comfort_w`, …). (The
+  human game keeps rolling through laps and off-tracks; only the RL episode
+  resets on them.)
 
 Registered as a Gymnasium id too:
 
@@ -132,10 +163,11 @@ env = gym.make("Racing-v0", render_mode="human")
 racing/car.py     vehicle dynamics (the physics)
 racing/track.py   procedural closed-loop track, progress + ray casting
 racing/env.py     Gymnasium env (obs / action / reward) — shared by human & agent
+racing/ppo.py     PPO actor-critic network (pure PyTorch) — shared by train & enjoy
 racing/render.py  top-down 2D pygame rendering (lazy-imported; headless training needs no display)
 racing/render3d.py  3D hood-cam renderer (perspective, software-rendered in pygame)
 play.py           drive it yourself
-train.py          PPO training (stable-baselines3)
+train.py          PPO training (pure PyTorch, curriculum learning)
 enjoy.py          watch a trained model
 smoke_test.py     headless checks
 ```

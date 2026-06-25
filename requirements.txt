@@ -7,4 +7,10 @@ gymnasium>=1.0
 pygame-ce>=2.5
 
 # RL training / playback (optional — only needed for train.py and enjoy.py).
-stable-baselines3>=2.3
+# Pure-PyTorch PPO lives in train.py — no stable-baselines3, no TensorBoard.
+# For a smaller CPU-only wheel:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+
+# Optional: Weights & Biases experiment tracking — only needed for `train.py --wandb`
+# (lazy-imported, so console/CSV logging works without it). Run `wandb login` once.
+wandb>=0.16

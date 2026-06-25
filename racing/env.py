@@ -54,6 +54,14 @@ class RacingEnv(gym.Env):
         off_track_rolling: float = 6.0,
         view: str = "hood",
         stage_dist: float = 12.0,
+        progress_w: float = 0.5,
+        time_cost: float = 0.05,
+        cte_w: float = 0.04,
+        heading_w: float = 0.02,
+        comfort_w: float = 0.015,
+        crash_penalty: float = 10.0,
+        crash_speed_w: float = 0.1,
+        lap_bonus: float = 100.0,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
@@ -80,6 +88,21 @@ class RacingEnv(gym.Env):
         self.off_track_grip = off_track_grip
         self.off_track_rolling = off_track_rolling
         self.stage_dist = stage_dist  # spawn this far before the line; clock waits
+
+        # Reward shaping (RL only — the human game ignores reward). Progress is the
+        # dense driver that makes going fast pay; the safety terms (cross-track and
+        # heading error) and the comfort term (action-change / anti-weave) are all
+        # kept small so they shape a clean line without overpowering "make forward
+        # progress" — which is what stops the agent reward-hacking into a slow,
+        # tidy crawl or spinning to farm survival.
+        self.progress_w = progress_w
+        self.time_cost = time_cost
+        self.cte_w = cte_w
+        self.heading_w = heading_w
+        self.comfort_w = comfort_w
+        self.crash_penalty = crash_penalty
+        self.crash_speed_w = crash_speed_w
+        self.lap_bonus = lap_bonus
 
         self.track: Track = make_track(seed=track_seed, profile=track_profile)
         self.car = Car(car_params)
@@ -163,6 +186,7 @@ class RacingEnv(gym.Env):
         # until the car first crosses it (see the arming branch in step()).
         x, y, yaw = self.track.pose_at(self.track.length - self.stage_dist)
         self.car.reset(x, y, yaw)
+        self._last_action = (0.0, 0.0)  # no phantom action-delta on the first tick
         self._steps = 0
         self._prev_s = self.track.project(x, y).s
         self._lap_progress = 0.0
@@ -187,6 +211,7 @@ class RacingEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         steer, throttle = float(action[0]), float(action[1])
+        prev_steer, prev_throttle = self._last_action  # last tick's command (anti-weave)
         self._last_action = (steer, throttle)
         s = self.car.s
 
@@ -259,12 +284,21 @@ class RacingEnv(gym.Env):
 
         # Progress is the dense signal; keep it strong enough that forward motion
         # is clearly worthwhile, so the agent doesn't turtle to dodge the crash.
-        reward = 0.5 * ds  # forward progress this tick
-        reward -= 0.05  # time cost: standing still loses
+        reward = self.progress_w * ds  # forward progress this tick
+        reward -= self.time_cost  # time cost: standing still loses
         if self.car.s.vx < 0.0:
-            reward -= 0.05  # discourage crawling backwards
+            reward -= self.time_cost  # discourage crawling backwards
         if off_track:
             reward -= 1.0  # ongoing cost while off the track
+        else:
+            # On-track shaping, all small vs. progress: hug the centre, point down
+            # the track, and don't saw at the controls. Off-track is handled by the
+            # crash term below, so we don't double up the safety penalties there.
+            heading_err = _wrap(proj.heading - s.yaw)
+            cte = proj.lateral / self.track.half  # ~[-1, 1] across the tarmac
+            reward -= self.cte_w * cte * cte
+            reward -= self.heading_w * heading_err * heading_err
+            reward -= self.comfort_w * (abs(steer - prev_steer) + abs(throttle - prev_throttle))
         terminated = False
         if off_track and self.terminate_off_track:
             # Speed-scaled crash penalty: plowing off at corner-entry speed should
@@ -272,10 +306,10 @@ class RacingEnv(gym.Env):
             # "floor it and crash" stays net-negative vs braking), but not so much
             # that the agent refuses to move at all. The v^2 term keeps it a
             # gradient ("shed speed for the corner"), gentle for low-speed offs.
-            reward -= 10.0 + 0.1 * s.vx * abs(s.vx)
+            reward -= self.crash_penalty + self.crash_speed_w * s.vx * abs(s.vx)
             terminated = True
         if lap_done and self.terminate_on_lap:
-            reward += 100.0
+            reward += self.lap_bonus
             terminated = True
 
         truncated = self._steps >= self.max_steps
