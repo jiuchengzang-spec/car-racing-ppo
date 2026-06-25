@@ -115,6 +115,13 @@ Checkpoints land in `./checkpoints` (`ppo_racing_<steps>.pt` plus a best-so-far
 `ppo_racing_best.pt`); the final policy is written to `--out` (default
 `ppo_racing.pt`).
 
+Training **auto-detects a CUDA GPU** (`--device cpu` / `--device cuda` to force).
+Heads-up: the policy is a tiny MLP and the physics env runs on the CPU, so env
+stepping dominates wall-clock. On a laptop GPU the default 64-wide net actually
+ran *faster on CPU* (~1080 vs ~740 FPS); the two only break even around
+`--hidden 256`. So for the default config CPU is the better pick — reach for the
+GPU once you scale the network (or batch) up.
+
 **Optional — Weights & Biases.** Console/CSV logging needs nothing extra, but you
 can mirror every update to [W&B](https://wandb.ai) with `--wandb` (`wandb` is only
 imported when you pass it):
@@ -131,23 +138,32 @@ curriculum stage. Defaults: entity `jiucheng-zang-venuiti-solutions`, project
 
 ## The RL problem
 
-- **Observation** (`Box`, ~[-1, 1]): 11 rangefinder beams (distance to the wall
-  at fanned angles) + forward speed, lateral speed, yaw rate, heading error vs
-  the track tangent, and the car's current (rate-limited) steering angle. The
-  agent places itself laterally from the beams — there's no centreline-offset
-  crutch in the observation.
+The setup is built for **racing — exploit the limits, minimise lap time** — not
+lane-keeping, so the agent is free to use the whole track width and find the
+out-in-out line.
+
+- **Observation** (`Box`, ~[-1, 1], 23-dim): 11 rangefinder beams + forward
+  speed, lateral speed, yaw rate, heading error, steering angle + a **curvature
+  preview** (signed centreline curvature at 20 / 50 / 100 m ahead, so it reads the
+  corner before the beams do) + **tyre state** (front/rear slip angles, rear slip
+  ratio, vehicle sideslip — the cues a driver uses to catch a slide).
 - **Action** (`Box`): `[steer, throttle]`, each in `[-1, 1]` (throttle negative =
   brake/reverse).
-- **Reward**: forward progress along the track each step (the dense signal),
-  minus a small time cost (faster is better) and small **safety + comfort**
-  shaping — stay near the centreline, point down the track, and don't saw at the
-  controls (anti-weave) — plus a large penalty + episode end for leaving the
-  track and a bonus for completing the lap. The shaping weights are all small
-  next to progress, so the optimum stays "fast and clean", not "slow and tidy"
-  (and there's no survival bonus to farm by circling). The weights are tunable
-  `RacingEnv` args (`progress_w`, `cte_w`, `heading_w`, `comfort_w`, …). (The
-  human game keeps rolling through laps and off-tracks; only the RL episode
-  resets on them.)
+- **Reward**: forward progress along the track **spline** (Frenet Δs) plus a speed
+  term — so the optimum is the fast geometric line, not the centre. Performance
+  **drifting is allowed**: only sideslip past a threshold (`slip_threshold`) is
+  penalised, to discourage spinouts without killing a controllable slide. Control
+  penalties are light (aggressive limit-of-grip counter-steer shouldn't be taxed).
+  **Graduated track limits**: running wide onto the grass is a recoverable per-step
+  cost (and voids the lap), and only a *full* track exit ends the episode with a
+  heavy, speed-scaled crash penalty — no instant reset for a minor clip. All
+  weights are tunable `RacingEnv` args (`progress_w`, `speed_w`, `slip_w`,
+  `grass_penalty`, …; the civilian `cte_w`/`heading_w` default to 0).
+- **Training interventions**: episodes start at **racing speed** (60–150 km/h
+  rolling starts, `--spawn-speed-kmh`) so the policy manages high momentum from
+  tick one instead of creeping to dodge crashes; the optimiser is **AdamW**. (The
+  human game keeps rolling through laps and off-tracks; only the RL episode resets,
+  on a lap or a full track exit.)
 
 Registered as a Gymnasium id too:
 

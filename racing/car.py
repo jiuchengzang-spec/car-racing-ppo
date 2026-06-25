@@ -238,6 +238,27 @@ class Car:
     def set_pose(self, x: float, y: float, yaw: float) -> None:
         self.s.x, self.s.y, self.s.yaw = x, y, yaw
 
+    def rolling_start(self, speed: float) -> None:
+        """Begin already rolling straight ahead at ``speed`` m/s (for RL inits).
+
+        Sets the forward velocity and matches the driven-wheel surface speed (no
+        launch wheelspin), then selects the lowest gear whose rpm sits at/under the
+        upshift point — so the first throttle isn't bouncing off the limiter. Used
+        to spawn episodes at racing speed and break the "drive 5 km/h to never
+        crash" local optimum.
+        """
+        s, p = self.s, self.p
+        s.vx = float(speed)
+        s.vy = 0.0
+        s.r = 0.0
+        s.wheel_v_r = float(speed)
+        s.gear = len(p.gear_ratios) - 1
+        for g in range(len(p.gear_ratios)):
+            if self._engine_rpm(speed, g) <= p.shift_up_rpm:
+                s.gear = g
+                break
+        s.engine_rpm = self._engine_rpm(speed, s.gear)
+
     def step(
         self,
         steer_cmd: float,

@@ -62,6 +62,9 @@ class Track:
         ang = np.arctan2(tangents[:, 1], tangents[:, 0])
         dang = (np.roll(ang, -1) - ang + math.pi) % (2.0 * math.pi) - math.pi
         self.curvature = np.abs(dang) / seg_len
+        # Signed version (+ = left turn, - = right): the agent's curvature-preview
+        # observation needs the corner *direction*, not just its tightness.
+        self.curvature_signed = dang / seg_len
 
         self.left = centerline + self._normals * self.half
         self.right = centerline - self._normals * self.half
@@ -100,6 +103,13 @@ class Track:
         lateral = float(np.dot(rel, self._normals[i]))
         heading = float(math.atan2(self._tangents[i, 1], self._tangents[i, 0]))
         return Projection(s=s, lateral=lateral, heading=heading, segment=i)
+
+    def curvature_at(self, s: float) -> float:
+        """Signed centreline curvature (rad/m, + = left turn) at arc-length ``s``."""
+        s = s % self.length
+        i = int(np.searchsorted(self._s0, s, side="right") - 1)
+        i = max(0, min(i, len(self._s0) - 1))
+        return float(self.curvature_signed[i])
 
     def is_inside(self, x: float, y: float, margin: float = 0.0) -> bool:
         return abs(self.project(x, y).lateral) <= self.half + margin

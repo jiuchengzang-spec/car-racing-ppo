@@ -8,7 +8,10 @@ pygame-ce>=2.5
 
 # RL training / playback (optional — only needed for train.py and enjoy.py).
 # Pure-PyTorch PPO lives in train.py — no stable-baselines3, no TensorBoard.
-# For a smaller CPU-only wheel:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+# The default Linux wheel is CUDA-enabled and train.py auto-uses the GPU. Pick a
+# build matching your machine if the default doesn't fit:
+#   GPU (CUDA 13):  pip install torch --index-url https://download.pytorch.org/whl/cu130
+#   CPU-only:       pip install torch --index-url https://download.pytorch.org/whl/cpu
 torch>=2.0
 
 # Optional: Weights & Biases experiment tracking — only needed for `train.py --wandb`

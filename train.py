@@ -6,9 +6,14 @@
 
 No stable-baselines3 and no TensorBoard — just numpy + gymnasium + torch. The
 agent is a small actor-critic MLP over the env's low-dimensional observation
-(11 rangefinders + forward/lateral speed + yaw rate + heading error + steer).
+(rangefinders + speeds + heading + steer + curvature preview + tyre slip).
 Updates are textbook PPO: clipped surrogate, GAE(lambda), advantage
-normalisation, a few epochs of minibatch SGD, optional KL early-stop.
+normalisation, a few epochs of minibatch SGD, optional KL early-stop, AdamW with
+linear learning-rate annealing.
+
+Racing-specific defaults: episodes start at racing speed (`--spawn-speed-kmh`,
+60-150 km/h rolling starts) so the policy must manage high momentum from tick one
+rather than creeping along to dodge crash penalties.
 
 **Curriculum learning** (on by default): training starts on easy *flowing*
 tracks (fast, open sweepers — forgiving), then auto-advances to *balanced* and
@@ -88,20 +93,23 @@ class SyncVec:
         return next_obs, rewards, terminated, truncated, term_obs, infos
 
 
-def make_env_fn(profile: str, base_seed: int, randomize: bool, pool: int):
+def make_env_fn(profile: str, base_seed: int, randomize: bool, pool: int,
+                spawn_speed: tuple[float, float] | None):
     def thunk(idx: int) -> RacingEnv:
         return RacingEnv(
             track_seed=base_seed,
             track_profile=profile,
             randomize_track=randomize,
             track_pool=pool,
+            spawn_speed=spawn_speed,
         )
 
     return thunk
 
 
 def build_vec(stage_cfg: dict, args, device_seed: int) -> SyncVec:
-    fn = make_env_fn(stage_cfg["profile"], args.track_seed, stage_cfg["randomize"], stage_cfg["pool"])
+    fn = make_env_fn(stage_cfg["profile"], args.track_seed, stage_cfg["randomize"],
+                     stage_cfg["pool"], args.spawn_speed)
     return SyncVec(fn, args.n_envs, base_seed=args.seed + device_seed)
 
 
@@ -118,6 +126,9 @@ def main() -> None:
     ap.add_argument("--ent-coef", type=float, default=0.01)
     ap.add_argument("--vf-coef", type=float, default=0.5)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay")
+    ap.add_argument("--anneal-lr", action=argparse.BooleanOptionalAction, default=True,
+                    help="linearly decay the learning rate to 0 over training (standard PPO; --no-anneal-lr to disable)")
     ap.add_argument("--max-grad-norm", type=float, default=0.5)
     ap.add_argument("--target-kl", type=float, default=0.03, help="early-stop epochs past this KL (<=0 disables)")
     ap.add_argument("--hidden", type=int, default=64)
@@ -128,6 +139,9 @@ def main() -> None:
     ap.add_argument("--randomize-track", action="store_true", help="(--no-curriculum) vary the track each episode")
     ap.add_argument("--track-pool", type=int, default=10, help="(--no-curriculum) pool size for --randomize-track (0 = unbounded)")
     ap.add_argument("--track-profile", default="balanced", help="(--no-curriculum) track character")
+    ap.add_argument("--spawn-speed-kmh", type=float, nargs=2, default=[60.0, 150.0],
+                    metavar=("LO", "HI"),
+                    help="rolling-start speed range (km/h) for RL episodes; '0 0' starts from rest")
     ap.add_argument("--advance-lap-rate", type=float, default=0.5, help="advance a stage once this fraction of recent episodes finish a lap")
     ap.add_argument("--stage-min-steps", type=int, default=300_000, help="minimum env steps before a stage may advance")
     # IO.
@@ -141,6 +155,10 @@ def main() -> None:
     ap.add_argument("--wandb-project", default="racing-car-ppo training")
     ap.add_argument("--wandb-name", default="", help="W&B run name (blank = auto-generated)")
     args = ap.parse_args()
+
+    # Rolling-start speed range (km/h -> m/s); "0 0" means spawn from rest.
+    lo_kmh, hi_kmh = args.spawn_speed_kmh
+    args.spawn_speed = None if (lo_kmh <= 0 and hi_kmh <= 0) else (lo_kmh / 3.6, hi_kmh / 3.6)
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     torch.manual_seed(args.seed)
@@ -163,7 +181,8 @@ def main() -> None:
     print(f"obs_dim={obs_dim} act_dim={act_dim} device={device} stages={[s['name'] for s in stages]}")
 
     model = ActorCritic(obs_dim, act_dim, args.hidden).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+    # AdamW (decoupled weight decay) — a better default than Adam for this policy.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, eps=1e-5, weight_decay=args.weight_decay)
 
     n_envs, n_steps = args.n_envs, args.n_steps
     batch = n_envs * n_steps
@@ -193,7 +212,7 @@ def main() -> None:
         csv_file = open(args.csv, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(["step", "stage", "ep_return", "ep_len", "lap_rate",
-                             "pg_loss", "v_loss", "entropy", "approx_kl", "fps"])
+                             "pg_loss", "v_loss", "entropy", "approx_kl", "lr", "fps"])
 
     use_wandb = args.wandb
     if use_wandb:
@@ -217,6 +236,14 @@ def main() -> None:
 
     while global_step < args.timesteps:
         update += 1
+        # Linear LR anneal to 0 over training — a standard PPO stabiliser that
+        # tightens the policy as it converges (fraction of budget remaining * lr).
+        if args.anneal_lr:
+            cur_lr = max(0.0, 1.0 - global_step / args.timesteps) * args.lr
+            for g in optimizer.param_groups:
+                g["lr"] = cur_lr
+        else:
+            cur_lr = args.lr
         # --- collect a rollout ------------------------------------------------
         for t in range(n_steps):
             obs_buf[t] = next_obs
@@ -327,13 +354,13 @@ def main() -> None:
             f"upd {update:4d} | step {global_step:>9,} | {stages[stage_i]['name']:<7} "
             f"| ret {ret_s} | len {len_s} | lap {lap_rate:4.0%} "
             f"| pg {pg_loss.item():+.3f} | v {v_loss.item():.3f} | ent {entropy.item():.3f} "
-            f"| kl {approx_kl.item():.3f} | {fps} fps"
+            f"| kl {approx_kl.item():.3f} | lr {cur_lr:.1e} | {fps} fps"
         )
         if csv_writer:
             csv_writer.writerow([global_step, stages[stage_i]["name"], f"{mean_ret:.3f}",
                                  f"{mean_len:.1f}", f"{lap_rate:.4f}", f"{pg_loss.item():.4f}",
                                  f"{v_loss.item():.4f}", f"{entropy.item():.4f}",
-                                 f"{approx_kl.item():.4f}", fps])
+                                 f"{approx_kl.item():.4f}", f"{cur_lr:.6f}", fps])
             csv_file.flush()
         if use_wandb:
             log_dict = {
@@ -342,6 +369,7 @@ def main() -> None:
                 "losses/entropy": entropy.item(),
                 "losses/approx_kl": approx_kl.item(),
                 "charts/fps": fps,
+                "charts/lr": cur_lr,
                 "curriculum/stage_idx": stage_i,
             }
             if ret_hist:  # skip episode stats until the first episode has finished

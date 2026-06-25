@@ -3,17 +3,21 @@
 Observation (all roughly normalised to ~[-1, 1]):
     * N rangefinder beams: distance to the wall ahead at fanned-out angles
     * forward speed vx, lateral speed vy, yaw rate r
-    * heading error vs the track tangent (the agent must place itself laterally
-      from the rangefinder beams — no centreline-offset crutch)
-    * current steering angle (so the policy sees the rate-limited wheel angle it's
-      actually carrying, not just its last command)
+    * heading error vs the track tangent, current steering angle
+    * curvature preview: signed centreline curvature at fixed look-ahead
+      distances, so the agent reads the upcoming corner before the beams do
+    * tyre state: front/rear slip angles, rear slip ratio, vehicle sideslip —
+      what a driver feels at the limit and uses to catch a slide
 
 Action (Box, continuous):
     * steer in [-1, 1]      (left .. right)
     * throttle in [-1, 1]   (full brake/reverse .. full throttle)
 
-Reward rewards distance covered *along the track* each step, with a small time
-cost (so faster is better) and a crash penalty when the car leaves the track.
+Reward is racing-oriented: forward progress along the track spline (Frenet ds)
+plus a speed term, so the optimum is the fast geometric line, not the centreline.
+Performance drifting is allowed (only *excess* sideslip is penalised); running
+wide onto the grass is a recoverable cost, and only a full track exit ends the
+episode with a heavy crash penalty.
 """
 from __future__ import annotations
 
@@ -33,6 +37,12 @@ MAX_BEAM = 155.0  # m, matched to the 3D renderer's track draw distance (FAR_CLI
 # essential once tracks are randomised and it must react to unseen corners.
 MAX_SPEED_REF = 60.0  # m/s, used to normalise speed in the observation
 
+# Curvature-preview look-ahead distances (m) and observation normalisers.
+CURV_PREVIEW_M = (20.0, 50.0, 100.0)
+CURV_REF = 25.0  # curvature normaliser: a ~25 m-radius corner saturates to ~1
+SLIP_REF = math.radians(30.0)  # slip-angle normaliser (~30 deg = a big slide)
+BETA_REF = math.radians(45.0)  # vehicle-sideslip normaliser
+
 
 class RacingEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
@@ -44,7 +54,8 @@ class RacingEnv(gym.Env):
         track_profile: str = "balanced",
         dt: float = 1.0 / 60.0,
         max_steps: int = 4000,
-        off_track_margin: float = 1.2,
+        grass_margin: float = 0.5,
+        exit_margin: float = 2.5,
         randomize_track: bool = False,
         track_pool: int = 0,
         car_params: CarParams | None = None,
@@ -55,20 +66,29 @@ class RacingEnv(gym.Env):
         view: str = "hood",
         stage_dist: float = 12.0,
         progress_w: float = 0.5,
+        speed_w: float = 0.003,
         time_cost: float = 0.05,
-        cte_w: float = 0.04,
-        heading_w: float = 0.02,
-        comfort_w: float = 0.015,
+        slip_w: float = 0.04,
+        slip_threshold: float = math.radians(22.0),
+        comfort_w: float = 0.003,
+        cte_w: float = 0.0,
+        heading_w: float = 0.0,
+        grass_penalty: float = 0.5,
         crash_penalty: float = 10.0,
         crash_speed_w: float = 0.1,
         lap_bonus: float = 100.0,
+        spawn_speed: tuple[float, float] | None = None,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
         self.view = view  # "hood" (3D in-car) or "top" (overhead)
         self.dt = dt
         self.max_steps = max_steps
-        self.off_track_margin = off_track_margin
+        # Graduated track limits: past the painted edge by ``grass_margin`` puts
+        # wheels on the grass (a recoverable, lap-voiding cost); past ``exit_margin``
+        # is a full track exit (terminal). No instant reset for a minor clip.
+        self.grass_margin = grass_margin
+        self.exit_margin = exit_margin
         self.randomize_track = randomize_track
         self._base_seed = track_seed
         self.track_profile = track_profile
@@ -89,26 +109,34 @@ class RacingEnv(gym.Env):
         self.off_track_rolling = off_track_rolling
         self.stage_dist = stage_dist  # spawn this far before the line; clock waits
 
-        # Reward shaping (RL only — the human game ignores reward). Progress is the
-        # dense driver that makes going fast pay; the safety terms (cross-track and
-        # heading error) and the comfort term (action-change / anti-weave) are all
-        # kept small so they shape a clean line without overpowering "make forward
-        # progress" — which is what stops the agent reward-hacking into a slow,
-        # tidy crawl or spinning to farm survival.
+        # Reward shaping (RL only — the human game ignores reward). The philosophy
+        # is *exploit the limits, minimise lap time*, not lane-keeping: progress
+        # along the spline (Frenet ds) plus a speed term is the dense driver, so the
+        # optimum is the fast geometric line. ``slip_w``/``slip_threshold`` allow
+        # performance drifting and only punish the excess sideslip of a spinout;
+        # ``comfort_w`` is small so aggressive limit-of-grip counter-steer isn't
+        # taxed. The centre/heading terms (``cte_w``/``heading_w``) default to 0 —
+        # kept as knobs for a "civilian" tune, but off for racing.
         self.progress_w = progress_w
+        self.speed_w = speed_w
         self.time_cost = time_cost
+        self.slip_w = slip_w
+        self.slip_threshold = slip_threshold
+        self.comfort_w = comfort_w
         self.cte_w = cte_w
         self.heading_w = heading_w
-        self.comfort_w = comfort_w
+        self.grass_penalty = grass_penalty
         self.crash_penalty = crash_penalty
         self.crash_speed_w = crash_speed_w
         self.lap_bonus = lap_bonus
+        self.spawn_speed = spawn_speed  # (lo, hi) m/s rolling start, or None
 
         self.track: Track = make_track(seed=track_seed, profile=track_profile)
         self.car = Car(car_params)
 
         self._beams = np.radians(np.array(BEAM_ANGLES_DEG, dtype=np.float64))
-        n_obs = len(self._beams) + 5
+        # beams + [vx, vy, r, heading_err, steer] + curvature preview + tyre state
+        n_obs = len(self._beams) + 5 + len(CURV_PREVIEW_M) + 4
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(n_obs,), dtype=np.float32
         )
@@ -186,6 +214,11 @@ class RacingEnv(gym.Env):
         # until the car first crosses it (see the arming branch in step()).
         x, y, yaw = self.track.pose_at(self.track.length - self.stage_dist)
         self.car.reset(x, y, yaw)
+        if self.spawn_speed is not None:
+            # Rolling start at racing speed so the policy must handle high momentum
+            # from the first tick (the "Grandma Driver" fix — no creeping to safety).
+            lo, hi = self.spawn_speed
+            self.car.rolling_start(float(self.np_random.uniform(lo, hi)))
         self._last_action = (0.0, 0.0)  # no phantom action-delta on the first tick
         self._steps = 0
         self._prev_s = self.track.project(x, y).s
@@ -218,7 +251,7 @@ class RacingEnv(gym.Env):
         # The surface under the car right now sets grip for this tick: grass off
         # the track is slippery and draggy, so leaving the tarmac costs time.
         surface = self.track.project(s.x, s.y)
-        on_grass = abs(surface.lateral) > self.track.half + self.off_track_margin
+        on_grass = abs(surface.lateral) > self.track.half + self.grass_margin
         grip_mult = self.off_track_grip if on_grass else 1.0
         rolling_mult = self.off_track_rolling if on_grass else 1.0
         self.car.step(steer, throttle, self.dt, grip_mult=grip_mult, rolling_mult=rolling_mult)
@@ -237,9 +270,10 @@ class RacingEnv(gym.Env):
         self._prev_s = proj.s
         self._lap_progress += ds
 
-        off_track = abs(proj.lateral) > self.track.half + self.off_track_margin
-        if off_track:
-            self._lap_valid = False  # any wheel off the track voids the lap
+        on_grass_now = abs(proj.lateral) > self.track.half + self.grass_margin
+        fully_off = abs(proj.lateral) > self.track.half + self.exit_margin
+        if on_grass_now:
+            self._lap_valid = False  # a wheel on the grass voids the lap
 
         clt = (self._steps - self._lap_start_step) * self.dt  # current-lap time
 
@@ -250,7 +284,7 @@ class RacingEnv(gym.Env):
             self._timing_armed = True
             self._lap_start_step = self._steps
             self._lap_progress = 0.0
-            self._lap_valid = not off_track
+            self._lap_valid = not on_grass_now
             self._begin_sectors()
         elif crossed_finish and self._lap_progress > self.track.length * 0.5:
             # A full lap: close out the final sector, bank the lap, start the next.
@@ -273,7 +307,7 @@ class RacingEnv(gym.Env):
                         self._best_sectors[k] = sp
             self._lap_start_step = self._steps
             self._lap_progress -= self.track.length
-            self._lap_valid = not off_track
+            self._lap_valid = not on_grass_now
             self._begin_sectors()
         elif self._timing_armed:
             # Mid-lap: close out sector(s) as we pass the arc-length thirds.
@@ -282,25 +316,38 @@ class RacingEnv(gym.Env):
                 self._complete_sector(self._cur_sector, clt)
                 self._cur_sector += 1
 
-        # Progress is the dense signal; keep it strong enough that forward motion
-        # is clearly worthwhile, so the agent doesn't turtle to dodge the crash.
-        reward = self.progress_w * ds  # forward progress this tick
+        # Progress along the spline (Frenet ds) is the dense driver, with a speed
+        # term so going fast pays directly — together they make the fast geometric
+        # line the optimum, not the centreline.
+        reward = self.progress_w * ds + self.speed_w * max(s.vx, 0.0)
         reward -= self.time_cost  # time cost: standing still loses
-        if self.car.s.vx < 0.0:
+        if s.vx < 0.0:
             reward -= self.time_cost  # discourage crawling backwards
-        if off_track:
-            reward -= 1.0  # ongoing cost while off the track
+
+        # Sideslip stability: allow performance drifting up to slip_threshold, then
+        # penalise the excess — discourages catastrophic spinouts without killing a
+        # controllable slide. Keyed on real speed so a parked car stays quiet.
+        if s.speed > 2.0:
+            beta = abs(math.atan2(s.vy, abs(s.vx) + 1e-3))
+            if beta > self.slip_threshold:
+                reward -= self.slip_w * (beta - self.slip_threshold)
+        # Relaxed comfort term (anti-weave), small so limit-of-grip counter-steer
+        # isn't taxed.
+        reward -= self.comfort_w * (abs(steer - prev_steer) + abs(throttle - prev_throttle))
+
+        if fully_off:
+            pass  # the crash term below handles a full exit
+        elif on_grass_now:
+            reward -= self.grass_penalty  # ran wide onto the grass — recoverable cost
         else:
-            # On-track shaping, all small vs. progress: hug the centre, point down
-            # the track, and don't saw at the controls. Off-track is handled by the
-            # crash term below, so we don't double up the safety penalties there.
+            # Optional centre/heading shaping — 0 by default for racing (the racing
+            # line is not the centreline), but kept tunable for a civilian feel.
             heading_err = _wrap(proj.heading - s.yaw)
             cte = proj.lateral / self.track.half  # ~[-1, 1] across the tarmac
             reward -= self.cte_w * cte * cte
             reward -= self.heading_w * heading_err * heading_err
-            reward -= self.comfort_w * (abs(steer - prev_steer) + abs(throttle - prev_throttle))
         terminated = False
-        if off_track and self.terminate_off_track:
+        if fully_off and self.terminate_off_track:
             # Speed-scaled crash penalty: plowing off at corner-entry speed should
             # cost more than the progress banked on the straight before it (so
             # "floor it and crash" stays net-negative vs braking), but not so much
@@ -315,7 +362,8 @@ class RacingEnv(gym.Env):
         truncated = self._steps >= self.max_steps
 
         info = self._info()
-        info["off_track"] = off_track
+        info["off_track"] = fully_off  # full track exit (terminal); not a grass clip
+        info["on_grass"] = on_grass_now
         info["lap_done"] = lap_done
 
         if self.render_mode == "human":
@@ -358,7 +406,24 @@ class RacingEnv(gym.Env):
             np.clip(heading_err / math.pi, -1.0, 1.0),
             np.clip(s.steer / self.car.p.max_steer, -1.0, 1.0),
         ]
-        return np.array(dists + extra, dtype=np.float32)
+        # Curvature preview: signed centreline curvature at fixed look-ahead
+        # distances, so the policy can read the corner (direction + tightness) and
+        # set up the line/brake point before the wall beams pick it up.
+        curv = [
+            np.clip(self.track.curvature_at(proj.s + d) * CURV_REF, -1.0, 1.0)
+            for d in CURV_PREVIEW_M
+        ]
+        # Tyre state at the limit: front/rear slip angles, rear slip ratio, and the
+        # vehicle sideslip beta — the cues a driver uses to feel and catch a slide.
+        kappa = (s.wheel_v_r - s.vx) / max(abs(s.vx), self.car.p.slip_vx_floor)
+        beta = math.atan2(s.vy, abs(s.vx) + 1e-3)
+        tyre = [
+            np.clip(s.slip_f / SLIP_REF, -1.0, 1.0),
+            np.clip(s.slip_r / SLIP_REF, -1.0, 1.0),
+            np.clip(kappa, -1.0, 1.0),
+            np.clip(beta / BETA_REF, -1.0, 1.0),
+        ]
+        return np.array(dists + extra + curv + tyre, dtype=np.float32)
 
     def _info(self) -> dict[str, Any]:
         s = self.car.s
