@@ -1,0 +1,10 @@
+# Core: physics, env, and human play.
+numpy>=1.26
+gymnasium>=1.0
+# pygame-ce is a drop-in fork of pygame (still `import pygame`) that ships
+# prebuilt wheels for new Python versions much sooner — upstream pygame has no
+# wheel for Python 3.14 yet and tries (and fails) to compile from source.
+pygame-ce>=2.5
+
+# RL training / playback (optional — only needed for train.py and enjoy.py).
+stable-baselines3>=2.3
