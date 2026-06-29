@@ -21,6 +21,9 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, default=8000,
                     help="episode step limit before a 'timeout' truncation (env runs at 60 Hz, so "
                          "8000 ≈ 133 s — enough for a full lap; the 4000 env default truncates long laps)")
+    ap.add_argument("--corner-brake-w", type=float, default=0.04,
+                    help="corner-brake reward weight — doesn't change driving here, only populates the "
+                         "corner_brake term in the --viz reward breakdown (0 to hide it)")
     ap.add_argument("--stochastic", action="store_true", help="sample actions instead of using the mean")
     ap.add_argument("--viz", action="store_true", help="open a separate window visualising the model's activations")
     ap.add_argument("--smooth-steer", type=float, default=0.6, metavar="A",
@@ -34,7 +37,7 @@ def main() -> None:
     from racing.ppo import load_policy
 
     env = RacingEnv(render_mode="human", track_seed=args.track_seed, track_profile=args.track,
-                    max_steps=args.max_steps)
+                    max_steps=args.max_steps, corner_brake_w=args.corner_brake_w)
     model, meta = load_policy(args.model)
     if meta:
         print(f"loaded {args.model}  (trained to step {meta.get('step', '?')})")
@@ -72,7 +75,7 @@ def main() -> None:
                 if viz.closed(events):
                     running = False
                 else:
-                    viz.update(model.activations(obs))
+                    viz.update(model.activations(obs), info)
             if not running:
                 break
             action = model.act(obs, deterministic=not args.stochastic)

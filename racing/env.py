@@ -357,31 +357,36 @@ class RacingEnv(gym.Env):
                 self._cur_sector += 1
                 sectors_gained += 1
 
+        # Reward, tracked term-by-term so `enjoy.py --viz` can show what is driving
+        # (or penalising) the agent this step. The step reward is the sum of terms.
+        terms = {}
         # Progress along the spline (Frenet ds) is the dense driver, with a speed
         # term so going fast pays directly — together they make the fast geometric
         # line the optimum, not the centreline.
-        reward = self.progress_w * ds + self.speed_w * max(s.vx, 0.0)
-        reward -= self.time_cost  # time cost: standing still loses
-        if s.vx < 0.0:
-            reward -= self.time_cost  # discourage crawling backwards
-
+        terms["progress"] = self.progress_w * ds
+        terms["speed"] = self.speed_w * max(s.vx, 0.0)
+        # Time cost: standing still loses; doubled while crawling backwards.
+        terms["time"] = -self.time_cost * (2.0 if s.vx < 0.0 else 1.0)
         # Sideslip stability: allow performance drifting up to slip_threshold, then
         # penalise the excess — discourages catastrophic spinouts without killing a
         # controllable slide. Keyed on real speed so a parked car stays quiet.
+        slip_pen = 0.0
         if s.speed > 2.0:
             beta = abs(math.atan2(s.vy, abs(s.vx) + 1e-3))
             if beta > self.slip_threshold:
-                reward -= self.slip_w * (beta - self.slip_threshold)
+                slip_pen = -self.slip_w * (beta - self.slip_threshold)
+        terms["slip"] = slip_pen
         # Relaxed comfort term (anti-weave), small so limit-of-grip counter-steer
         # isn't taxed.
-        reward -= self.comfort_w * (abs(steer - prev_steer) + abs(throttle - prev_throttle))
+        terms["comfort"] = -self.comfort_w * (abs(steer - prev_steer) + abs(throttle - prev_throttle))
         # Checkpoint bonus for reaching a new track third this step (see sector_bonus).
-        reward += self.sector_bonus * sectors_gained
+        terms["sector"] = self.sector_bonus * sectors_gained
         # Corner-braking: penalise carrying too much speed into the corner AHEAD —
         # predicted lateral accel (v^2 * upcoming curvature) beyond a safe budget. This
         # teaches the agent to BRAKE for deep-angle curves (match speed to the corner)
         # instead of plowing in and running wide — a generic skill that helps on
         # unseen/sharp corners. 0 = off.
+        cb_pen = 0.0
         if self.corner_brake_w > 0.0 and s.vx > 0.0:
             cur_curv = abs(self.track.curvature_at(proj.s))
             upcoming_curv = abs(self.track.curvature_at(proj.s + self.corner_lookahead))
@@ -390,31 +395,37 @@ class RacingEnv(gym.Env):
             # agent gets back on power on EXIT instead of coasting out of the corner.
             if upcoming_curv > cur_curv:
                 a_lat_pred = s.vx * s.vx * upcoming_curv  # predicted lateral accel into the corner
-                reward -= self.corner_brake_w * max(0.0, a_lat_pred - self.corner_alat_safe)
-
+                cb_pen = -self.corner_brake_w * max(0.0, a_lat_pred - self.corner_alat_safe)
+        terms["corner_brake"] = cb_pen
+        # Graduated track limits: a grass clip is a recoverable per-step cost; a full
+        # exit is handled by the terminal crash term below (no grass/lane double-count).
+        terms["grass"] = 0.0
+        terms["lane"] = 0.0
         if fully_off:
             pass  # the crash term below handles a full exit
         elif on_grass_now:
-            reward -= self.grass_penalty  # ran wide onto the grass — recoverable cost
+            terms["grass"] = -self.grass_penalty  # ran wide onto the grass — recoverable cost
         else:
             # Optional centre/heading shaping — 0 by default for racing (the racing
             # line is not the centreline), but kept tunable for a civilian feel.
             heading_err = _wrap(proj.heading - s.yaw)
             cte = proj.lateral / self.track.half  # ~[-1, 1] across the tarmac
-            reward -= self.cte_w * cte * cte
-            reward -= self.heading_w * heading_err * heading_err
+            terms["lane"] = -(self.cte_w * cte * cte + self.heading_w * heading_err * heading_err)
         terminated = False
+        terms["crash"] = 0.0
         if fully_off and self.terminate_off_track:
             # Speed-scaled crash penalty: plowing off at corner-entry speed should
             # cost more than the progress banked on the straight before it (so
             # "floor it and crash" stays net-negative vs braking), but not so much
             # that the agent refuses to move at all. The v^2 term keeps it a
             # gradient ("shed speed for the corner"), gentle for low-speed offs.
-            reward -= self.crash_penalty + self.crash_speed_w * s.vx * abs(s.vx)
+            terms["crash"] = -(self.crash_penalty + self.crash_speed_w * s.vx * abs(s.vx))
             terminated = True
+        terms["lap"] = 0.0
         if lap_done and self.terminate_on_lap:
-            reward += self.lap_bonus
+            terms["lap"] = self.lap_bonus
             terminated = True
+        reward = float(sum(terms.values()))
 
         truncated = self._steps >= self.max_steps
 
@@ -422,6 +433,8 @@ class RacingEnv(gym.Env):
         info["off_track"] = fully_off  # full track exit (terminal); not a grass clip
         info["on_grass"] = on_grass_now
         info["lap_done"] = lap_done
+        info["reward"] = reward
+        info["reward_terms"] = terms  # per-term breakdown for the --viz HUD
 
         if self.render_mode == "human":
             self.render()

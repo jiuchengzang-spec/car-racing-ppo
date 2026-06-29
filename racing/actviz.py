@@ -3,9 +3,12 @@
 Opened by ``enjoy.py --viz`` alongside the driving view. Each frame it shows, top
 to bottom: the input observation (rangefinders + state + curvature preview + tyre
 slip), both actor hidden layers as heatmaps, the action mean/std it's outputting,
-the value estimate, and both critic hidden layers. Hidden units are tanh outputs
-in [-1, 1] — drawn red (positive) / blue (negative), brightness = magnitude — so
-you can watch which units light up going into a corner.
+the value estimate, a per-term reward-contribution breakdown (what the last step
+actually paid/charged), and both critic hidden layers. Hidden units are tanh
+outputs in [-1, 1] — drawn red (positive) / blue (negative), brightness =
+magnitude — so you can watch which units light up going into a corner. The heatmap
+cells auto-size to the network width, so a wider net (e.g. hidden 512) stays in
+the window instead of overflowing.
 
 Uses pygame-ce's multi-window ``pygame.Window`` API so it's a real separate OS
 window; the main driving window stays untouched. If that API isn't available it
@@ -16,10 +19,8 @@ from __future__ import annotations
 import numpy as np
 import pygame
 
-W, H = 560, 840
+W, H = 560, 880
 MARGIN = 20
-COLS = 32           # heatmap columns for a 256-unit layer (-> 8 rows)
-CELL = 15
 BG = (16, 18, 22)
 FG = (208, 212, 220)
 DIM = (120, 126, 138)
@@ -58,15 +59,23 @@ class ActivationViz:
         self.surf.blit(self.fs.render(text, True, color), (x, y))
 
     def _grid(self, vec: np.ndarray, x: int, y: int, label: str) -> int:
-        """Draw a vector as a COLS-wide heatmap grid; return the y below it."""
-        self._label(label, x, y, FG)
+        """Draw a vector as a heatmap grid sized to FIT the window; return y below it.
+
+        Cells auto-shrink with the layer width (a 512-unit hidden layer packs into the
+        same band a 256-unit one used to), so wider nets don't blow past the window.
+        """
+        n = len(vec)
+        avail = W - 2 * MARGIN
+        rows = 8 if n > 128 else max(1, (n + 15) // 16)  # ~8 rows for big layers
+        cols = (n + rows - 1) // rows
+        cell = max(4, min(15, avail // cols))            # fill width, capped 4..15px
+        self._label(f"{label}  ({n}, tanh)", x, y, FG)
         y += 15
-        rows = (len(vec) + COLS - 1) // COLS
         for i, v in enumerate(vec):
-            cx = x + (i % COLS) * CELL
-            cy = y + (i // COLS) * CELL
-            pygame.draw.rect(self.surf, _heat(v), (cx, cy, CELL - 1, CELL - 1))
-        return y + rows * CELL + 10
+            cx = x + (i % cols) * cell
+            cy = y + (i // cols) * cell
+            pygame.draw.rect(self.surf, _heat(v), (cx, cy, cell - 1, cell - 1))
+        return y + rows * cell + 10
 
     def _center_label(self, text: str, cx: float, y: float, color=DIM) -> None:
         surf = self.fs.render(text, True, color)
@@ -101,9 +110,40 @@ class ActivationViz:
         self.surf.blit(self.f.render(f"{val:+.2f}", True, FG), (bx + bw + 12, y))
         self._label(f"σ {std:.2f}", bx + bw + 78, y + 2)
 
+    # Fixed display order for the reward terms (see racing.env step()).
+    _TERM_ORDER = ("progress", "speed", "time", "slip", "comfort",
+                   "sector", "corner_brake", "grass", "crash", "lap")
+
+    def _reward_breakdown(self, terms: dict, x: int, y: int) -> int:
+        """Per-term reward contributions as signed bars (green +, red −); bars are
+        scaled to the largest-magnitude term this step so you can see what dominates."""
+        total = float(sum(terms.values()))
+        self.surf.blit(self.fb.render("reward", True, FG), (x, y))
+        tcol = (150, 210, 150) if total >= 0 else (212, 150, 150)
+        self.surf.blit(self.f.render(f"Σ {total:+.2f}", True, tcol), (x + 64, y + 1))
+        y += 22
+        shown = [(k, float(terms.get(k, 0.0))) for k in self._TERM_ORDER]
+        scale = max(1e-6, max(abs(v) for _, v in shown))
+        bx, bw = x + 96, 150
+        cx = bx + bw // 2
+        for name, v in shown:
+            active = abs(v) > 1e-6
+            self._label(name, x, y + 1, FG if active else DIM)
+            pygame.draw.rect(self.surf, (40, 43, 52), (bx, y, bw, 11), border_radius=3)
+            pygame.draw.line(self.surf, DIM, (cx, y - 1), (cx, y + 12), 1)
+            if active:
+                w = max(1, int((abs(v) / scale) * (bw // 2 - 2)))
+                if v >= 0:
+                    pygame.draw.rect(self.surf, (96, 176, 120), (cx, y, w, 11), border_radius=3)
+                else:
+                    pygame.draw.rect(self.surf, (200, 110, 110), (cx - w, y, w, 11), border_radius=3)
+                self.surf.blit(self.fs.render(f"{v:+.2f}", True, FG), (bx + bw + 8, y + 1))
+            y += 14
+        return y + 8
+
     # -- public -----------------------------------------------------------
 
-    def update(self, acts: dict) -> None:
+    def update(self, acts: dict, info: dict | None = None) -> None:
         if not self._open:
             return
         s = self.surf
@@ -112,8 +152,8 @@ class ActivationViz:
         s.blit(self.fb.render("policy activations", True, FG), (x, 8))
         y = 36
         y = self._obs_row(acts["obs"], x, y)
-        y = self._grid(acts["actor_hidden"][0], x, y, "actor hidden 1  (256, tanh)")
-        y = self._grid(acts["actor_hidden"][1], x, y, "actor hidden 2  (256, tanh)")
+        y = self._grid(acts["actor_hidden"][0], x, y, "actor hidden 1")
+        y = self._grid(acts["actor_hidden"][1], x, y, "actor hidden 2")
 
         # outputs
         s.blit(self.fb.render("outputs", True, FG), (x, y))
@@ -127,8 +167,16 @@ class ActivationViz:
         s.blit(self.f.render(f"value  {acts['value']:+.1f}", True, vcol), (x, y))
         y += 26
 
-        y = self._grid(acts["critic_hidden"][0], x, y, "critic hidden 1  (256, tanh)")
-        y = self._grid(acts["critic_hidden"][1], x, y, "critic hidden 2  (256, tanh)")
+        # reward breakdown (what the last env step actually paid / charged)
+        terms = (info or {}).get("reward_terms")
+        if terms:
+            y = self._reward_breakdown(terms, x, y)
+        else:
+            self._label("reward breakdown — start driving to populate", x, y, DIM)
+            y += 22
+
+        y = self._grid(acts["critic_hidden"][0], x, y, "critic hidden 1")
+        y = self._grid(acts["critic_hidden"][1], x, y, "critic hidden 2")
         self._label("red = +   blue = −   brightness = |activation|", x, H - 18)
         self.window.flip()
 
