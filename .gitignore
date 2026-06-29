@@ -6,4 +6,6 @@ venv/
 ppo_racing*
 checkpoints/
 *.csv
+*.log
 wandb/
+.claude/

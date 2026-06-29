@@ -31,11 +31,20 @@ from gymnasium import spaces
 from .car import Car, CarParams
 from .track import Track, make_track
 
-BEAM_ANGLES_DEG = (-90, -60, -40, -25, -12, 0, 12, 25, 40, 60, 90)
+# 15 rangefinder beams, packed densely toward the front (4-10 deg apart near 0)
+# and sparser to the sides — fine forward vision is what matters for placing the
+# car into a corner; the wide beams just need to catch a wall.
+BEAM_ANGLES_DEG = (-90, -60, -42, -28, -18, -10, -4, 0, 4, 10, 18, 28, 42, 60, 90)
 MAX_BEAM = 155.0  # m, matched to the 3D renderer's track draw distance (FAR_CLIP)
 # so the agent "sees" the same distance of track ahead that a human driver does —
 # essential once tracks are randomised and it must react to unseen corners.
 MAX_SPEED_REF = 60.0  # m/s, used to normalise speed in the observation
+# Asymmetric per-tick rate limit on the beams (normalised units, [0,1]). The wave
+# the policy saws on comes from a beam clearing a track edge and jumping near->far
+# in one tick. That spurious LENGTHENING is non-urgent, so cap how fast a beam may
+# grow; SHORTENING (a wall appearing — react now) is left instant. Caps the wobble
+# without dulling collision reaction. ~0.05/tick = a full 0->155 m sweep in ~20 ticks.
+BEAM_RISE_MAX = 0.05
 
 # Curvature-preview look-ahead distances (m) and observation normalisers.
 CURV_PREVIEW_M = (20.0, 50.0, 100.0)
@@ -65,6 +74,7 @@ class RacingEnv(gym.Env):
         off_track_rolling: float = 6.0,
         view: str = "hood",
         stage_dist: float = 12.0,
+        beam_smooth: float = 0.4,
         progress_w: float = 0.5,
         speed_w: float = 0.003,
         time_cost: float = 0.05,
@@ -77,6 +87,10 @@ class RacingEnv(gym.Env):
         crash_penalty: float = 10.0,
         crash_speed_w: float = 0.1,
         lap_bonus: float = 100.0,
+        sector_bonus: float = 0.0,
+        corner_brake_w: float = 0.0,
+        corner_lookahead: float = 25.0,
+        corner_alat_safe: float = 12.0,
         spawn_speed: tuple[float, float] | None = None,
     ) -> None:
         super().__init__()
@@ -109,6 +123,16 @@ class RacingEnv(gym.Env):
         self.off_track_rolling = off_track_rolling
         self.stage_dist = stage_dist  # spawn this far before the line; clock waits
 
+        # Rangefinder beams are filtered before the policy sees them: a beam grazing
+        # a wall during a turn jumps near<->far, which was making the policy saw the
+        # wheel left-right. We rate-limit how fast a beam may LENGTHEN (the spurious
+        # clear-to-far jump that drives the wobble) while letting it SHORTEN instantly
+        # (a wall appearing — react now), then EMA-smooth the residual. The renderer
+        # draws the filtered values too, so the beams you see match what the agent
+        # reacts to. beam_smooth in [0, 1): 0 = rate-limit only, higher = more EMA/lag.
+        self.beam_smooth = beam_smooth
+        self._beam_dist: np.ndarray | None = None  # filtered normalised beam distances
+
         # Reward shaping (RL only — the human game ignores reward). The philosophy
         # is *exploit the limits, minimise lap time*, not lane-keeping: progress
         # along the spline (Frenet ds) plus a speed term is the dense driver, so the
@@ -129,6 +153,16 @@ class RacingEnv(gym.Env):
         self.crash_penalty = crash_penalty
         self.crash_speed_w = crash_speed_w
         self.lap_bonus = lap_bonus
+        # Checkpoint reward: paid each time the car reaches a new track third (sector
+        # 1/3, 2/3). A denser "get all the way around" gradient on top of the finish
+        # bonus, so the agent is pulled toward closing the lap instead of banking
+        # progress and crashing. 0 keeps the original behaviour.
+        self.sector_bonus = sector_bonus
+        # Corner-braking: penalise predicted over-speed (v^2 * upcoming-curvature
+        # beyond corner_alat_safe) for the corner corner_lookahead metres ahead.
+        self.corner_brake_w = corner_brake_w
+        self.corner_lookahead = corner_lookahead
+        self.corner_alat_safe = corner_alat_safe
         self.spawn_speed = spawn_speed  # (lo, hi) m/s rolling start, or None
 
         self.track: Track = make_track(seed=track_seed, profile=track_profile)
@@ -220,6 +254,8 @@ class RacingEnv(gym.Env):
             lo, hi = self.spawn_speed
             self.car.rolling_start(float(self.np_random.uniform(lo, hi)))
         self._last_action = (0.0, 0.0)  # no phantom action-delta on the first tick
+        self._beam_dist = None  # fresh start: no carry-over smoothing from last episode
+        self._update_beams()
         self._steps = 0
         self._prev_s = self.track.project(x, y).s
         self._lap_progress = 0.0
@@ -256,6 +292,7 @@ class RacingEnv(gym.Env):
         rolling_mult = self.off_track_rolling if on_grass else 1.0
         self.car.step(steer, throttle, self.dt, grip_mult=grip_mult, rolling_mult=rolling_mult)
         self._steps += 1
+        self._update_beams()  # cast + EMA-smooth the rangefinders for this tick
 
         proj = self.track.project(s.x, s.y)
 
@@ -278,6 +315,7 @@ class RacingEnv(gym.Env):
         clt = (self._steps - self._lap_start_step) * self.dt  # current-lap time
 
         lap_done = False
+        sectors_gained = 0  # new track-thirds reached this step (for the checkpoint bonus)
         if crossed_finish and not self._timing_armed:
             # First crossing out of the staging spot: this is where the clock and
             # sector 1 actually start — the launch run before it doesn't count.
@@ -310,11 +348,14 @@ class RacingEnv(gym.Env):
             self._lap_valid = not on_grass_now
             self._begin_sectors()
         elif self._timing_armed:
-            # Mid-lap: close out sector(s) as we pass the arc-length thirds.
+            # Mid-lap: close out sector(s) as we pass the arc-length thirds. Each new
+            # third reached pays sector_bonus (below) — a denser "get all the way
+            # around" signal that pulls the agent toward closing the lap.
             sec = min(int(proj.s / self._sec_len), 2)
             while self._cur_sector < sec and self._cur_sector < 2:
                 self._complete_sector(self._cur_sector, clt)
                 self._cur_sector += 1
+                sectors_gained += 1
 
         # Progress along the spline (Frenet ds) is the dense driver, with a speed
         # term so going fast pays directly — together they make the fast geometric
@@ -334,6 +375,22 @@ class RacingEnv(gym.Env):
         # Relaxed comfort term (anti-weave), small so limit-of-grip counter-steer
         # isn't taxed.
         reward -= self.comfort_w * (abs(steer - prev_steer) + abs(throttle - prev_throttle))
+        # Checkpoint bonus for reaching a new track third this step (see sector_bonus).
+        reward += self.sector_bonus * sectors_gained
+        # Corner-braking: penalise carrying too much speed into the corner AHEAD —
+        # predicted lateral accel (v^2 * upcoming curvature) beyond a safe budget. This
+        # teaches the agent to BRAKE for deep-angle curves (match speed to the corner)
+        # instead of plowing in and running wide — a generic skill that helps on
+        # unseen/sharp corners. 0 = off.
+        if self.corner_brake_w > 0.0 and s.vx > 0.0:
+            cur_curv = abs(self.track.curvature_at(proj.s))
+            upcoming_curv = abs(self.track.curvature_at(proj.s + self.corner_lookahead))
+            # Only brake for a corner that is still TIGHTENING ahead (entry). Once the
+            # curve is opening up (upcoming <= current), release the penalty so the
+            # agent gets back on power on EXIT instead of coasting out of the corner.
+            if upcoming_curv > cur_curv:
+                a_lat_pred = s.vx * s.vx * upcoming_curv  # predicted lateral accel into the corner
+                reward -= self.corner_brake_w * max(0.0, a_lat_pred - self.corner_alat_safe)
 
         if fully_off:
             pass  # the crash term below handles a full exit
@@ -384,6 +441,18 @@ class RacingEnv(gym.Env):
                 self._renderer = HoodCamRenderer(self.track, self.car.p, self.render_mode)
         return self._renderer.draw(self.car, self._beams, self._info())
 
+    def toggle_view(self) -> str:
+        """Swap between the 3D hood cam and the top-down overhead view, live.
+
+        The renderer is just dropped (rebuilt on the next render, re-using the same
+        window) — we don't ``close()`` it, since that calls ``pygame.quit()`` and
+        would tear down the whole session (including any activation-viz window).
+        Returns the new view name.
+        """
+        self.view = "top" if self.view == "hood" else "hood"
+        self._renderer = None
+        return self.view
+
     def close(self) -> None:
         if self._renderer is not None:
             self._renderer.close()
@@ -391,12 +460,38 @@ class RacingEnv(gym.Env):
 
     # -- helpers ----------------------------------------------------------
 
+    def _cast_beams(self) -> np.ndarray:
+        """Raw normalised rangefinder distances at the current pose ([0, 1])."""
+        s = self.car.s
+        return np.array(
+            [self.track.cast_ray(s.x, s.y, s.yaw + a, MAX_BEAM) / MAX_BEAM for a in self._beams],
+            dtype=np.float32,
+        )
+
+    def _update_beams(self) -> None:
+        """Cast the beams, rate-limit lengthening to kill the clear-to-far wobble, EMA.
+
+        A beam clearing a track edge jumps near->far in one tick — a spurious step that
+        sawed the wheel. We cap how fast each beam may GROW (BEAM_RISE_MAX/tick) but let
+        it SHRINK instantly so a wall appearing still reads immediately; the EMA then
+        smooths the residual. On a fresh episode the filter is primed from the first cast.
+        """
+        raw = self._cast_beams()
+        if self._beam_dist is None:  # fresh episode: no carry-over from the last one
+            self._beam_dist = raw
+            return
+        delta = raw - self._beam_dist
+        delta = np.where(delta > 0.0, np.minimum(delta, BEAM_RISE_MAX), delta)  # cap rise only
+        target = self._beam_dist + delta
+        if self.beam_smooth <= 0.0:
+            self._beam_dist = target.astype(np.float32)
+        else:
+            k = self.beam_smooth
+            self._beam_dist = (k * self._beam_dist + (1.0 - k) * target).astype(np.float32)
+
     def _obs(self) -> np.ndarray:
         s = self.car.s
-        dists = [
-            self.track.cast_ray(s.x, s.y, s.yaw + a, MAX_BEAM) / MAX_BEAM
-            for a in self._beams
-        ]
+        dists = list(self._beam_dist)  # smoothed (see _update_beams)
         proj = self.track.project(s.x, s.y)
         heading_err = _wrap(proj.heading - s.yaw)
         extra = [
@@ -451,6 +546,9 @@ class RacingEnv(gym.Env):
             "valid_laps": len(self._lap_times),
             "lap_valid": self._lap_valid,
             "steer_overlay": self.steer_overlay,
+            # Smoothed beam distances (metres) so the renderer draws the stable
+            # values the agent sees, not a fresh (jittery) raycast.
+            "beam_dists_m": None if self._beam_dist is None else (self._beam_dist * MAX_BEAM).tolist(),
             "steer_cmd": self._last_action[0],
             "throttle_app": max(self._last_action[1], 0.0),
             "brake_app": max(-self._last_action[1], 0.0),

@@ -43,9 +43,12 @@ from racing.ppo import ActorCritic, save_policy
 # of seeds (derived from --track-seed) drawn from one "character" profile: flowing
 # sweepers are the gentlest to keep on, technical hairpins the most punishing.
 CURRICULUM = [
-    {"name": "easy", "profile": "flowing", "pool": 4},
-    {"name": "medium", "profile": "balanced", "pool": 8},
-    {"name": "hard", "profile": "technical", "pool": 16},
+    # Unbounded pools (a fresh track every episode) so the policy must GENERALISE,
+    # not memorise a fixed set — the only way to score is to read each new corner and
+    # set speed for it. Eval is on separate held-out seeds (see eval_envs).
+    {"name": "easy", "profile": "flowing", "pool": 0},
+    {"name": "medium", "profile": "balanced", "pool": 0},
+    {"name": "hard", "profile": "technical", "pool": 0},
 ]
 
 
@@ -94,7 +97,7 @@ class SyncVec:
 
 
 def make_env_fn(profile: str, base_seed: int, randomize: bool, pool: int,
-                spawn_speed: tuple[float, float] | None):
+                spawn_speed: tuple[float, float] | None, reward_kwargs: dict):
     def thunk(idx: int) -> RacingEnv:
         return RacingEnv(
             track_seed=base_seed,
@@ -102,15 +105,43 @@ def make_env_fn(profile: str, base_seed: int, randomize: bool, pool: int,
             randomize_track=randomize,
             track_pool=pool,
             spawn_speed=spawn_speed,
+            **reward_kwargs,
         )
 
     return thunk
 
 
 def build_vec(stage_cfg: dict, args, device_seed: int) -> SyncVec:
+    reward_kwargs = dict(lap_bonus=args.lap_bonus, sector_bonus=args.sector_bonus,
+                         speed_w=args.speed_w, crash_penalty=args.crash_penalty,
+                         max_steps=args.max_steps, beam_smooth=args.beam_smooth,
+                         corner_brake_w=args.corner_brake_w)
     fn = make_env_fn(stage_cfg["profile"], args.track_seed, stage_cfg["randomize"],
-                     stage_cfg["pool"], args.spawn_speed)
+                     stage_cfg["pool"], args.spawn_speed, reward_kwargs)
     return SyncVec(fn, args.n_envs, base_seed=args.seed + device_seed)
+
+
+@torch.no_grad()
+def evaluate_deterministic(model: ActorCritic, env, device: str, n_episodes: int) -> float:
+    """Lap-completion rate of the *deterministic* (mean-action) policy.
+
+    THIS is the metric that matters for deployment: the stochastic rollout
+    lap_rate can be wildly optimistic when the policy leans on action noise — a
+    policy can score 95% stochastically yet 0% with the mean. Cheap eval on a
+    single env with fixed seeds so the number is comparable across updates.
+    """
+    laps = 0
+    for ep in range(n_episodes):
+        obs, _ = env.reset(seed=10_000 + ep)
+        done = False
+        info: dict = {}
+        while not done:
+            t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            action = model.actor_mean(t).squeeze(0).clamp(-1.0, 1.0).cpu().numpy()
+            obs, _, term, trunc, info = env.step(action)
+            done = term or trunc
+        laps += int(bool(info.get("lap_done")))
+    return laps / max(n_episodes, 1)
 
 
 def main() -> None:
@@ -129,6 +160,8 @@ def main() -> None:
     ap.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay")
     ap.add_argument("--anneal-lr", action=argparse.BooleanOptionalAction, default=True,
                     help="linearly decay the learning rate to 0 over training (standard PPO; --no-anneal-lr to disable)")
+    ap.add_argument("--anneal-ent", action=argparse.BooleanOptionalAction, default=True,
+                    help="linearly decay the entropy coef to 0 — keeps a converged policy from being diffused by a constant entropy bonus")
     ap.add_argument("--max-grad-norm", type=float, default=0.5)
     ap.add_argument("--target-kl", type=float, default=0.03, help="early-stop epochs past this KL (<=0 disables)")
     ap.add_argument("--hidden", type=int, default=64)
@@ -142,11 +175,23 @@ def main() -> None:
     ap.add_argument("--spawn-speed-kmh", type=float, nargs=2, default=[60.0, 150.0],
                     metavar=("LO", "HI"),
                     help="rolling-start speed range (km/h) for RL episodes; '0 0' starts from rest")
+    # Reward shaping (env weights). Defaults match RacingEnv; raise --lap-bonus /
+    # --sector-bonus and drop --speed-w to push the agent to *close* laps.
+    ap.add_argument("--lap-bonus", type=float, default=100.0, help="reward for completing a lap")
+    ap.add_argument("--sector-bonus", type=float, default=0.0, help="reward per new track third reached (denser lap-closing signal)")
+    ap.add_argument("--speed-w", type=float, default=0.003, help="reward weight on forward speed (0 = rely on progress only)")
+    ap.add_argument("--crash-penalty", type=float, default=10.0, help="penalty for a full track exit")
+    ap.add_argument("--max-steps", type=int, default=4000, help="episode truncation limit (raise so a clean lap doesn't time out before finishing)")
+    ap.add_argument("--beam-smooth", type=float, default=0.4, help="EMA smoothing on the rangefinder beams (0=raw, higher=steadier obs)")
+    ap.add_argument("--corner-brake-w", type=float, default=0.0, help="penalty weight for over-speeding into the upcoming corner (teaches braking for deep-angle curves; 0=off)")
     ap.add_argument("--advance-lap-rate", type=float, default=0.5, help="advance a stage once this fraction of recent episodes finish a lap")
     ap.add_argument("--stage-min-steps", type=int, default=300_000, help="minimum env steps before a stage may advance")
     # IO.
     ap.add_argument("--out", default="ppo_racing.pt")
+    ap.add_argument("--init-from", default="", help="warm-start the policy from this .pt checkpoint (must match --hidden / obs dims)")
     ap.add_argument("--save-freq", type=int, default=200_000, help="checkpoint every N env steps")
+    ap.add_argument("--eval-freq", type=int, default=200_000, help="deterministic eval every N env steps")
+    ap.add_argument("--eval-episodes", type=int, default=5, help="deterministic eval episodes (0 = disable; this is the real deployable metric)")
     ap.add_argument("--csv", default="", help="also append a row per update to this CSV file")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     # Weights & Biases experiment tracking (opt-in; wandb is only imported when used).
@@ -181,6 +226,19 @@ def main() -> None:
     print(f"obs_dim={obs_dim} act_dim={act_dim} device={device} stages={[s['name'] for s in stages]}")
 
     model = ActorCritic(obs_dim, act_dim, args.hidden).to(device)
+    if args.init_from:
+        # Warm-start: load policy+value weights from a prior checkpoint to continue
+        # training (e.g. focus an already-decent agent on a harder track) instead of
+        # starting from scratch. Optimizer state isn't carried (a clean LR schedule).
+        from racing.ppo import load_policy
+        src, _ = load_policy(args.init_from, device=device)
+        if (src.obs_dim, src.act_dim, src.hidden) != (obs_dim, act_dim, args.hidden):
+            raise SystemExit(
+                f"--init-from net dims {(src.obs_dim, src.act_dim, src.hidden)} "
+                f"!= current {(obs_dim, act_dim, args.hidden)}"
+            )
+        model.load_state_dict(src.state_dict())
+        print(f"warm-started policy from {args.init_from}")
     # AdamW (decoupled weight decay) — a better default than Adam for this policy.
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, eps=1e-5, weight_decay=args.weight_decay)
 
@@ -211,7 +269,7 @@ def main() -> None:
     if args.csv:
         csv_file = open(args.csv, "w", newline="")
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["step", "stage", "ep_return", "ep_len", "lap_rate",
+        csv_writer.writerow(["step", "stage", "ep_return", "ep_len", "lap_rate", "det_lap",
                              "pg_loss", "v_loss", "entropy", "approx_kl", "lr", "fps"])
 
     use_wandb = args.wandb
@@ -227,10 +285,33 @@ def main() -> None:
         )
 
     os.makedirs("checkpoints", exist_ok=True)
+    ckpt_prefix = os.path.splitext(os.path.basename(args.out))[0]  # so runs don't clobber
+    # Deterministic-eval envs (the real deployable metric). For a curriculum run the
+    # GOAL is generalization, so eval on HELD-OUT tracks (randomize + unbounded pool,
+    # fixed eval seeds 10000+) across ALL profiles — not just the easy stage-0 — so
+    # det_lap reflects "all tracks". A --no-curriculum run evals its single configured
+    # setting, as before. Reward kwargs are irrelevant to eval (it only checks laps).
+    eval_reward = dict(lap_bonus=args.lap_bonus, sector_bonus=args.sector_bonus,
+                       speed_w=args.speed_w, crash_penalty=args.crash_penalty,
+                       max_steps=args.max_steps, beam_smooth=args.beam_smooth,
+                       corner_brake_w=args.corner_brake_w)
+    eval_envs = {}
+    if args.eval_episodes > 0:
+        if args.no_curriculum:
+            eval_envs[stages[0]["profile"]] = make_env_fn(
+                stages[0]["profile"], args.track_seed, stages[0]["randomize"],
+                stages[0]["pool"], args.spawn_speed, eval_reward)(0)
+        else:
+            for _prof in ("flowing", "balanced", "technical"):
+                eval_envs[_prof] = make_env_fn(_prof, args.track_seed, True, 0,
+                                               args.spawn_speed, eval_reward)(0)
     global_step = 0
     stage_step0 = 0
     next_save = args.save_freq
+    next_eval = args.eval_freq
     best_return = -1e18
+    best_det = -1.0  # best deterministic lap rate seen (the deployable best)
+    last_det = float("nan")  # latest deterministic eval value (carried into the CSV)
     start = time.time()
     update = 0
 
@@ -244,6 +325,13 @@ def main() -> None:
                 g["lr"] = cur_lr
         else:
             cur_lr = args.lr
+        # Anneal the entropy bonus to 0 too: it's vital for exploration early, but a
+        # constant bonus inflates (diffuses) the policy once it has converged — which
+        # collapsed two earlier runs. Decaying it lets the policy settle and hold.
+        if args.anneal_ent:
+            cur_ent = max(0.0, 1.0 - global_step / args.timesteps) * args.ent_coef
+        else:
+            cur_ent = args.ent_coef
         # --- collect a rollout ------------------------------------------------
         for t in range(n_steps):
             obs_buf[t] = next_obs
@@ -330,7 +418,7 @@ def main() -> None:
                 pg_loss = torch.max(pg1, pg2).mean()
                 v_loss = 0.5 * ((new_val - b_ret[mb_t]) ** 2).mean()
                 entropy = ent.mean()
-                loss = pg_loss - args.ent_coef * entropy + args.vf_coef * v_loss
+                loss = pg_loss - cur_ent * entropy + args.vf_coef * v_loss
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -358,7 +446,7 @@ def main() -> None:
         )
         if csv_writer:
             csv_writer.writerow([global_step, stages[stage_i]["name"], f"{mean_ret:.3f}",
-                                 f"{mean_len:.1f}", f"{lap_rate:.4f}", f"{pg_loss.item():.4f}",
+                                 f"{mean_len:.1f}", f"{lap_rate:.4f}", f"{last_det:.4f}", f"{pg_loss.item():.4f}",
                                  f"{v_loss.item():.4f}", f"{entropy.item():.4f}",
                                  f"{approx_kl.item():.4f}", f"{cur_lr:.6f}", fps])
             csv_file.flush()
@@ -370,6 +458,7 @@ def main() -> None:
                 "losses/approx_kl": approx_kl.item(),
                 "charts/fps": fps,
                 "charts/lr": cur_lr,
+                "charts/ent_coef": cur_ent,
                 "curriculum/stage_idx": stage_i,
             }
             if ret_hist:  # skip episode stats until the first episode has finished
@@ -381,12 +470,31 @@ def main() -> None:
         # --- checkpoints ------------------------------------------------------
         meta = {"step": global_step, "stage": stages[stage_i]["name"], "mean_return": mean_ret}
         if global_step >= next_save:
-            path = os.path.join("checkpoints", f"ppo_racing_{global_step}.pt")
+            path = os.path.join("checkpoints", f"{ckpt_prefix}_{global_step}.pt")
             save_policy(path, model, meta)
             next_save += args.save_freq
         if ret_hist and mean_ret > best_return:
             best_return = mean_ret
-            save_policy(os.path.join("checkpoints", "ppo_racing_best.pt"), model, meta)
+            save_policy(os.path.join("checkpoints", f"{ckpt_prefix}_best.pt"), model, meta)
+
+        # --- deterministic eval (the real, deployable metric) -----------------
+        if eval_envs and global_step >= next_eval:
+            next_eval += args.eval_freq
+            per_profile = {p: evaluate_deterministic(model, e, device, args.eval_episodes)
+                           for p, e in eval_envs.items()}
+            det_lap = sum(per_profile.values()) / len(per_profile)  # mean over profiles = "all tracks"
+            last_det = det_lap
+            std = float(torch.exp(model.log_std.detach()).mean())
+            brk = "  ".join(f"{p[:4]} {v:.0%}" for p, v in per_profile.items())
+            print(f"  [eval] det lap {det_lap:5.0%}  ({brk})  (action std {std:.2f})")
+            if use_wandb:
+                wd = {"charts/det_lap_rate": det_lap, "charts/action_std": std}
+                wd.update({f"charts/det_lap_{p}": v for p, v in per_profile.items()})
+                wandb.log(wd, step=global_step)
+            if det_lap > best_det:  # keep the best DEPLOYABLE (most general) policy separately
+                best_det = det_lap
+                save_policy(os.path.join("checkpoints", f"{ckpt_prefix}_detbest.pt"), model,
+                            {"step": global_step, "det_lap_rate": det_lap, "per_profile": per_profile})
 
         # --- curriculum advancement ------------------------------------------
         if (stage_i < len(stages) - 1

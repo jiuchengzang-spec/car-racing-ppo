@@ -91,6 +91,8 @@ LIMIT = (188, 190, 196)  # track-limit line painted on the boundary (grey-white)
 START = (240, 220, 90)
 HOOD = (34, 36, 42)
 HOOD_SHINE = (70, 74, 84)
+SENSOR = (96, 210, 150)       # rangefinder beam (what the agent "sees")
+SENSOR_HIT = (244, 232, 120)  # marker where a beam meets the wall
 
 # Scenery palette.
 TRUNK = (74, 52, 36)
@@ -188,6 +190,7 @@ class HoodCamRenderer:
         # meet it every frame, so we just track its current value.
         self._horizon_y = self.horizon_y
 
+        self.show_beams = True  # draw the agent's rangefinder beams (toggle: B in play.py)
         self._cam = np.zeros(3)
         self._fwd = np.array([1.0, 0.0, 0.0])
         self._right = np.array([0.0, -1.0, 0.0])
@@ -361,6 +364,9 @@ class HoodCamRenderer:
         # Start/finish line across the track.
         if ld[0] > NEAR and rd[0] > NEAR:
             pygame.draw.line(self.screen, START, tuple(ls[0]), tuple(rs[0]), 4)
+
+        if self.show_beams:
+            self._draw_beams(car, beam_angles, info)
 
         self._draw_hood()
         draw_hud(self.screen, self.font, self.big, info)
@@ -597,6 +603,55 @@ class HoodCamRenderer:
         if len(out) < 3:
             return None
         return [(self.cx + c[0] / c[2] * self.focal, self.cy - c[1] / c[2] * self.focal) for c in out]
+
+    def _draw_beams(self, car: Car, beam_angles: np.ndarray, info: dict) -> None:
+        """Draw the agent's rangefinder beams along the road (near-plane clipped).
+
+        Uses the env's *smoothed* beam distances (``info["beam_dists_m"]``) so the
+        lines are as steady as the values the policy reacts to — no grazing-ray
+        shake — anti-aliased and faded toward the grass with distance for a clean
+        look. Falls back to a live raycast if the env didn't supply distances.
+        """
+        s = car.s
+        z = 0.06  # lift a touch off the tarmac so the lines aren't depth-fought away
+        origin = np.array([s.x, s.y, z])
+        dists = info.get("beam_dists_m")
+        for i, a in enumerate(beam_angles):
+            ang = s.yaw + float(a)
+            if dists is not None and i < len(dists):
+                dist = float(dists[i])
+            else:
+                dist = self.track.cast_ray(s.x, s.y, ang, FAR_CLIP)
+            end = np.array([s.x + dist * math.cos(ang), s.y + dist * math.sin(ang), z])
+            seg = self._clip_segment(origin, end)
+            if seg is None:
+                continue
+            (p0, _), (p1, d1) = seg
+            col = _mix(SENSOR, GRASS, 0.6 * min(dist / FAR_CLIP, 1.0))  # fade with range
+            pygame.draw.aaline(self.screen, col, p0, p1)
+            if d1 > NEAR:  # mark where the beam hits the wall, if it's in front
+                pygame.draw.circle(self.screen, SENSOR_HIT, (int(p1[0]), int(p1[1])), 3)
+
+    def _clip_segment(self, p0_world: np.ndarray, p1_world: np.ndarray):
+        """Clip a world segment to depth >= NEAR and project; None if fully behind.
+
+        Returns ``((p0, depth0), (p1, depth1))`` of screen points.
+        """
+        r0, r1 = p0_world - self._cam, p1_world - self._cam
+        a = [float(r0 @ self._right), float(r0 @ self._up), float(r0 @ self._fwd)]
+        b = [float(r1 @ self._right), float(r1 @ self._up), float(r1 @ self._fwd)]
+        if a[2] < NEAR and b[2] < NEAR:
+            return None
+        if (a[2] < NEAR) != (b[2] < NEAR):  # one endpoint behind: clip it to the plane
+            t = (NEAR - a[2]) / (b[2] - a[2])
+            cross = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), NEAR]
+            if a[2] < NEAR:
+                a = cross
+            else:
+                b = cross
+        p0 = (self.cx + a[0] / a[2] * self.focal, self.cy - a[1] / a[2] * self.focal)
+        p1 = (self.cx + b[0] / b[2] * self.focal, self.cy - b[1] / b[2] * self.focal)
+        return (p0, a[2]), (p1, b[2])
 
     def _draw_hood(self) -> None:
         w, h = SCREEN_W, SCREEN_H

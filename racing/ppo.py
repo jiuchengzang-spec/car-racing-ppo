@@ -86,6 +86,35 @@ class ActorCritic(nn.Module):
         action = action.clamp(-1.0, 1.0).cpu().numpy()
         return action[0] if single else action
 
+    @torch.no_grad()
+    def activations(self, obs_np: np.ndarray) -> dict[str, Any]:
+        """Run a forward pass and return every intermediate activation (for viz).
+
+        Captures the post-Tanh outputs of each hidden layer in both heads, plus the
+        action mean / std and the value estimate, all as numpy. Single obs only.
+        """
+        obs = torch.as_tensor(np.asarray(obs_np, dtype=np.float32)).unsqueeze(0)
+
+        def run(seq: nn.Sequential) -> tuple[list[np.ndarray], np.ndarray]:
+            h = obs
+            hidden = []
+            for layer in seq:
+                h = layer(h)
+                if isinstance(layer, nn.Tanh):
+                    hidden.append(h.squeeze(0).cpu().numpy())
+            return hidden, h.squeeze(0).cpu().numpy()  # hidden tanh outs, final linear out
+
+        actor_hidden, mean = run(self.actor_mean)
+        critic_hidden, value = run(self.critic)
+        return {
+            "obs": np.asarray(obs_np, dtype=np.float32),
+            "actor_hidden": actor_hidden,
+            "critic_hidden": critic_hidden,
+            "mean": mean,
+            "std": torch.exp(self.log_std).cpu().numpy(),
+            "value": float(value[0]),
+        }
+
 
 def save_policy(path: str, model: ActorCritic, meta: dict[str, Any] | None = None) -> None:
     """Persist the policy as a small ``.pt`` (state dict + the dims to rebuild it)."""

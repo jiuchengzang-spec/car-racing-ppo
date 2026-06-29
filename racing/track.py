@@ -105,11 +105,19 @@ class Track:
         return Projection(s=s, lateral=lateral, heading=heading, segment=i)
 
     def curvature_at(self, s: float) -> float:
-        """Signed centreline curvature (rad/m, + = left turn) at arc-length ``s``."""
+        """Signed centreline curvature (rad/m, + = left turn) at arc-length ``s``.
+
+        Linearly interpolated between adjacent segments so the value is *continuous*
+        (no per-segment steps), which keeps the agent's curvature-preview input from
+        jittering as the look-ahead point crosses segment boundaries.
+        """
         s = s % self.length
+        n = len(self.curvature_signed)
         i = int(np.searchsorted(self._s0, s, side="right") - 1)
-        i = max(0, min(i, len(self._s0) - 1))
-        return float(self.curvature_signed[i])
+        i = max(0, min(i, n - 1))
+        frac = (s - self._s0[i]) / self._seg_len[i]
+        c = self.curvature_signed
+        return float((1.0 - frac) * c[i] + frac * c[(i + 1) % n])
 
     def is_inside(self, x: float, y: float, margin: float = 0.0) -> bool:
         return abs(self.project(x, y).lateral) <= self.half + margin

@@ -62,7 +62,7 @@ pip install -r requirements.txt        # core + RL
 ## Drive it
 
 ```bash
-python play.py                 # arrows / WASD; W·S throttle/brake; R restage; Esc quit
+python play.py                 # arrows / WASD; W·S throttle/brake; R restage; B beams; V view; Esc quit
 python play.py --mouse         # steer inside the on-screen steering zone
 python play.py --top-down      # overhead 2D view instead of the 3D hood cam
 python play.py --track-seed 7  # a different circuit
@@ -73,7 +73,10 @@ python play.py --handling ov   # handling preset: nimble | boat | un | ov (fair 
 By default you drive from a **3D hood camera** — a perspective view mounted at the
 car's nose that rotates with the car (software-rendered in pygame, no GPU or extra
 dependencies). Pass `--top-down` for the overhead view, which is handy for seeing
-the whole corner and the RL sensor beams.
+the whole corner — or **swap between the hood cam and the overhead view live with
+V** (works in `enjoy.py` too, so you can flip to the top-down to check the agent's
+overall position). Both views draw the agent's **rangefinder sensor beams** (the
+distances it observes) — toggle them with **B**.
 
 With `--mouse`, the cursor's left/right position steers **anywhere on screen**
 (the centre strip is a straight-ahead deadzone) — the **steering zone** drawn near
@@ -109,7 +112,14 @@ pip install torch                              # the only extra dep for training
 python train.py --timesteps 2_000_000          # PPO, 8 parallel envs, curriculum on
 python train.py --no-curriculum --randomize-track   # one randomised setting instead
 python enjoy.py --model ppo_racing.pt          # watch it drive
+python enjoy.py --model ppo_racing.pt --viz    # + a separate model-activation window
 ```
+
+`--viz` opens a second window showing the policy's live activations as it drives —
+the input observation, both actor/critic hidden layers as heatmaps (red = +,
+blue = −), and the action mean/std + value it's producing — handy for seeing
+which units fire going into a corner. Uses pygame-ce's multi-window support; if
+that's unavailable it just skips the viz.
 
 Checkpoints land in `./checkpoints` (`ppo_racing_<steps>.pt` plus a best-so-far
 `ppo_racing_best.pt`); the final policy is written to `--out` (default
@@ -142,11 +152,13 @@ The setup is built for **racing — exploit the limits, minimise lap time** — 
 lane-keeping, so the agent is free to use the whole track width and find the
 out-in-out line.
 
-- **Observation** (`Box`, ~[-1, 1], 23-dim): 11 rangefinder beams + forward
-  speed, lateral speed, yaw rate, heading error, steering angle + a **curvature
-  preview** (signed centreline curvature at 20 / 50 / 100 m ahead, so it reads the
-  corner before the beams do) + **tyre state** (front/rear slip angles, rear slip
-  ratio, vehicle sideslip — the cues a driver uses to catch a slide).
+- **Observation** (`Box`, ~[-1, 1], 27-dim): 15 rangefinder beams — packed densely
+  toward the front (fine corner vision) and **EMA-smoothed** so a beam grazing a
+  wall doesn't jitter the input (and saw the steering); + forward speed, lateral
+  speed, yaw rate, heading error, steering angle + a **curvature preview**
+  (continuous signed curvature at 20 / 50 / 100 m ahead) + **tyre state**
+  (front/rear slip angles, rear slip ratio, vehicle sideslip — the cues a driver
+  uses to catch a slide).
 - **Action** (`Box`): `[steer, throttle]`, each in `[-1, 1]` (throttle negative =
   brake/reverse).
 - **Reward**: forward progress along the track **spline** (Frenet Δs) plus a speed
@@ -180,10 +192,15 @@ racing/car.py     vehicle dynamics (the physics)
 racing/track.py   procedural closed-loop track, progress + ray casting
 racing/env.py     Gymnasium env (obs / action / reward) — shared by human & agent
 racing/ppo.py     PPO actor-critic network (pure PyTorch) — shared by train & enjoy
+racing/actviz.py  live activation-visualiser window (enjoy.py --viz)
 racing/render.py  top-down 2D pygame rendering (lazy-imported; headless training needs no display)
 racing/render3d.py  3D hood-cam renderer (perspective, software-rendered in pygame)
 play.py           drive it yourself
 train.py          PPO training (pure PyTorch, curriculum learning)
-enjoy.py          watch a trained model
+enjoy.py          watch a trained model (--viz for a model-activation window)
 smoke_test.py     headless checks
 ```
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE). Copyright (C) 2026 Jiucheng Zang, Venuiti Solutions.

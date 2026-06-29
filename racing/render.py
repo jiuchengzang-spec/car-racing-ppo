@@ -93,12 +93,17 @@ class PygameRenderer:
         sl = self._to_screen(np.stack([self.track.left[0], self.track.right[0]]))
         pygame.draw.line(self.screen, START, sl[0], sl[1], 4)
 
-        # Sensor beams.
-        for a in beam_angles:
-            d = self.track.cast_ray(s.x, s.y, s.yaw + a, 60.0)
-            end = np.array([s.x + d * math.cos(s.yaw + a), s.y + d * math.sin(s.yaw + a)])
+        # Sensor beams: the env's smoothed distances (capped for this view), anti-aliased.
+        beam_d = info.get("beam_dists_m")
+        for i, a in enumerate(beam_angles):
+            ang = s.yaw + a
+            if beam_d is not None and i < len(beam_d):
+                d = min(float(beam_d[i]), 60.0)
+            else:
+                d = self.track.cast_ray(s.x, s.y, ang, 60.0)
+            end = np.array([s.x + d * math.cos(ang), s.y + d * math.sin(ang)])
             seg = self._to_screen(np.stack([[s.x, s.y], end]))
-            pygame.draw.line(self.screen, BEAM, seg[0], seg[1], 1)
+            pygame.draw.aaline(self.screen, BEAM, seg[0], seg[1])
 
         self._draw_car(car)
         self._draw_hud(info)

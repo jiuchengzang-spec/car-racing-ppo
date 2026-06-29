@@ -4,7 +4,8 @@
 
 Controls: arrow keys or WASD to steer; W/Up throttle, S/Down brake (reverses once
 stopped). With ``--mouse``, left/right mouse position steers and the mouse buttons
-(or W/S) drive and brake. R restages (keeping your records), Esc / window-close quits.
+(or W/S) drive and brake. R restages (keeping your records), B toggles the sensor
+beams, V swaps the hood cam <-> top-down view, Esc / window-close quits.
 
 You keep driving through off-track moments and finish lines — the HUD tracks your
 current, last and best lap, and going off the track voids the lap in progress. You
@@ -71,6 +72,13 @@ def main() -> None:
                 throttle_cmd = 0.0
                 brake_cmd = 0.0
                 last_count = env._info()["lap_count"]
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+                # Toggle the rangefinder-beam overlay (the agent's "vision").
+                r = env._renderer
+                if r is not None and hasattr(r, "show_beams"):
+                    r.show_beams = not r.show_beams
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_v:
+                env.toggle_view()  # swap hood cam <-> top-down overhead
 
         keys = pygame.key.get_pressed()
         up = keys[pygame.K_UP] or keys[pygame.K_w]
