@@ -90,7 +90,10 @@ def main() -> None:
             obs, _, terminated, truncated, info = env.step(action)
             done = terminated or truncated
         tag = "lap!" if info.get("lap_done") else ("crash" if info.get("off_track") else "timeout")
-        print(f"episode {ep}: {tag}  time={info.get('time', 0):.2f}s  progress={info.get('lap_fraction', 0) * 100:.1f}%")
+        # On a completed lap the env wraps lap_progress back to ~0 for the next lap, so
+        # lap_fraction reads 0% at the line — a full lap is 100% by definition.
+        prog = 100.0 if info.get("lap_done") else info.get("lap_fraction", 0.0) * 100.0
+        print(f"episode {ep}: {tag}  time={info.get('time', 0):.2f}s  progress={prog:.1f}%")
 
     if viz is not None:
         viz.close()
