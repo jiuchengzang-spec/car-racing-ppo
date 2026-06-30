@@ -712,7 +712,7 @@ class HoodCamRenderer:
 
 def _radial_overlay(color: tuple) -> pygame.Surface:
     """A full-screen per-pixel-alpha overlay of `color`: transparent in the centre,
-    ramping opaque toward the edges. Reused for the speed vignette and brake glow."""
+    ramping opaque toward the edges. Used for the speed vignette."""
     yy, xx = np.mgrid[0:SCREEN_H, 0:SCREEN_W]
     cx, cy = SCREEN_W / 2.0, SCREEN_H * 0.52
     d = np.sqrt(((xx - cx) / (SCREEN_W * 0.60)) ** 2 + ((yy - cy) / (SCREEN_H * 0.60)) ** 2)
