@@ -192,12 +192,10 @@ class HoodCamRenderer:
         # meet it every frame, so we just track its current value.
         self._horizon_y = self.horizon_y
 
-        # Screen FX: a speed vignette (edges darken as you go faster) and a red brake
-        # glow, built once as radial per-pixel-alpha overlays and blitted at a
-        # speed/brake-scaled strength each frame. Plus rising tyre-smoke puffs when a
-        # tyre breaks traction.
+        # Screen FX: a speed vignette (edges darken as you go faster), built once as a
+        # radial per-pixel-alpha overlay and blitted at speed-scaled strength each
+        # frame. Plus rising tyre-smoke puffs when a tyre breaks traction.
         self._vignette = _radial_overlay((6, 7, 10))
-        self._brakeglow = _radial_overlay((170, 32, 26))
         self._smoke: deque = deque(maxlen=48)
 
         self.show_beams = True  # draw the agent's rangefinder beams (toggle: B in play.py)
@@ -671,19 +669,14 @@ class HoodCamRenderer:
         pygame.draw.line(self.screen, HOOD_SHINE, (w * 0.5, h), (w * 0.5, h - 86), 2)
 
     def _draw_speed_fx(self, info: dict) -> None:
-        """Speed vignette + brake glow + tyre smoke — drawn over the world, under the
-        HUD, so the instruments stay crisp on top."""
+        """Speed vignette + tyre smoke — drawn over the world, under the HUD, so the
+        instruments stay crisp on top."""
         speed = float(info.get("speed", 0.0))
         k = min(speed / 75.0, 1.0)              # ~270 km/h ≈ full vignette
         if k > 0.02:
             v = self._vignette.copy()
             v.fill((255, 255, 255, int(255 * 0.5 * k)), special_flags=pygame.BLEND_RGBA_MULT)
             self.screen.blit(v, (0, 0))
-        brake = float(info.get("brake_app", 0.0))
-        if brake > 0.05:
-            g = self._brakeglow.copy()
-            g.fill((255, 255, 255, int(255 * 0.5 * min(brake, 1.0))), special_flags=pygame.BLEND_RGBA_MULT)
-            self.screen.blit(g, (0, 0))
         self._draw_smoke(info)
 
     def _draw_smoke(self, info: dict) -> None:
