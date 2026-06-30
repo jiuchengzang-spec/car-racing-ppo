@@ -115,7 +115,7 @@ def build_vec(stage_cfg: dict, args, device_seed: int) -> SyncVec:
     reward_kwargs = dict(lap_bonus=args.lap_bonus, sector_bonus=args.sector_bonus,
                          speed_w=args.speed_w, crash_penalty=args.crash_penalty,
                          max_steps=args.max_steps, beam_smooth=args.beam_smooth,
-                         corner_brake_w=args.corner_brake_w)
+                         corner_brake_w=args.corner_brake_w, comfort_w=args.comfort_w)
     fn = make_env_fn(stage_cfg["profile"], args.track_seed, stage_cfg["randomize"],
                      stage_cfg["pool"], args.spawn_speed, reward_kwargs)
     return SyncVec(fn, args.n_envs, base_seed=args.seed + device_seed)
@@ -184,6 +184,7 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, default=4000, help="episode truncation limit (raise so a clean lap doesn't time out before finishing)")
     ap.add_argument("--beam-smooth", type=float, default=0.4, help="EMA smoothing on the rangefinder beams (0=raw, higher=steadier obs)")
     ap.add_argument("--corner-brake-w", type=float, default=0.0, help="penalty weight for over-speeding into the upcoming corner (teaches braking for deep-angle curves; 0=off)")
+    ap.add_argument("--comfort-w", type=float, default=0.003, help="anti-weave penalty on per-step steer/throttle change — raise it (e.g. 0.02) to train smoother control")
     ap.add_argument("--advance-lap-rate", type=float, default=0.5, help="advance a stage once this fraction of recent episodes finish a lap")
     ap.add_argument("--stage-min-steps", type=int, default=300_000, help="minimum env steps before a stage may advance")
     # IO.
@@ -294,7 +295,7 @@ def main() -> None:
     eval_reward = dict(lap_bonus=args.lap_bonus, sector_bonus=args.sector_bonus,
                        speed_w=args.speed_w, crash_penalty=args.crash_penalty,
                        max_steps=args.max_steps, beam_smooth=args.beam_smooth,
-                       corner_brake_w=args.corner_brake_w)
+                       corner_brake_w=args.corner_brake_w, comfort_w=args.comfort_w)
     eval_envs = {}
     if args.eval_episodes > 0:
         if args.no_curriculum:
