@@ -8,6 +8,7 @@ car and the world is scaled metres -> pixels.
 from __future__ import annotations
 
 import math
+from collections import deque
 
 import numpy as np
 import pygame
@@ -40,6 +41,8 @@ GOOD = (120, 210, 140)
 PURPLE = (190, 130, 235)
 START = (240, 220, 90)
 ZONE = (90, 150, 200)
+TRAIL_COL = (96, 176, 232)   # racing-line trail (fades with age)
+SKID_COL = (20, 18, 22)      # rubber laid down when a tyre slides past grip
 
 
 class PygameRenderer:
@@ -57,6 +60,9 @@ class PygameRenderer:
         self.big = pygame.font.SysFont("consolas,menlo,monospace", 26, bold=True)
         self.clock = pygame.time.Clock()
         self._cam = np.array([0.0, 0.0])
+        self._trail: deque = deque(maxlen=240)  # recent car positions (racing-line trail)
+        self._skids: deque = deque(maxlen=700)  # world points where a tyre slid past grip
+        self._last_pos = None                   # to drop skids only when actually moving
 
     def _to_screen(self, pts: np.ndarray) -> np.ndarray:
         rel = (pts - self._cam) * PPM
@@ -67,6 +73,7 @@ class PygameRenderer:
     def draw(self, car: Car, beam_angles: np.ndarray, info: dict):
         s = car.s
         self._cam = np.array([s.x, s.y])
+        self._record_trail(car)
         self.screen.fill(GRASS)
 
         # Tarmac: filled ribbon between the two boundaries.
@@ -92,6 +99,9 @@ class PygameRenderer:
         # Start/finish line across the track at the first centreline point.
         sl = self._to_screen(np.stack([self.track.left[0], self.track.right[0]]))
         pygame.draw.line(self.screen, START, sl[0], sl[1], 4)
+
+        # Skid marks (rubber laid where a tyre slid) then the fading racing-line trail.
+        self._draw_skids_and_trail()
 
         # Sensor beams: the env's smoothed distances (capped for this view), anti-aliased.
         beam_d = info.get("beam_dists_m")
@@ -133,6 +143,49 @@ class PygameRenderer:
         nose = np.array([[L * 0.5, W * 0.32], [L * 0.5, -W * 0.32], [L * 0.2, 0.0]])
         nose_w = (nose @ rot.T) + np.array([s.x, s.y])
         pygame.draw.polygon(self.screen, CAR_NOSE, self._to_screen(nose_w).tolist())
+
+    def _record_trail(self, car: Car) -> None:
+        """Append the car position to the trail and lay skid points where a tyre is
+        sliding past grip. Clears on a big position jump (episode reset/restage)."""
+        s = car.s
+        p = (s.x, s.y)
+        if self._last_pos is not None:
+            dx, dy = p[0] - self._last_pos[0], p[1] - self._last_pos[1]
+            if dx * dx + dy * dy > 400.0:   # >20 m in one tick = teleport/reset
+                self._trail.clear()
+                self._skids.clear()
+        self._last_pos = p
+        self._trail.append(p)
+        if s.speed < 3.0:
+            return
+        L, W = self.p.length, self.p.width
+        c, sn = math.cos(s.yaw), math.sin(s.yaw)
+
+        def wheel(fx: float, fy: float):
+            return (s.x + fx * c - fy * sn, s.y + fx * sn + fy * c)
+
+        kappa = abs((s.wheel_v_r - s.vx) / max(abs(s.vx), self.p.slip_vx_floor))
+        if abs(s.slip_f) > SLIP_PEAK:                       # front sliding (understeer)
+            self._skids.append(wheel(L * 0.35, W * 0.42))
+            self._skids.append(wheel(L * 0.35, -W * 0.42))
+        if abs(s.slip_r) > SLIP_PEAK or kappa > SPIN_PEAK:  # rear sliding / wheelspin
+            self._skids.append(wheel(-L * 0.35, W * 0.42))
+            self._skids.append(wheel(-L * 0.35, -W * 0.42))
+
+    def _draw_skids_and_trail(self) -> None:
+        if self._skids:
+            for p in self._to_screen(np.array(self._skids, dtype=float)):
+                x, y = int(p[0]), int(p[1])
+                if -4 <= x <= SCREEN_W + 4 and -4 <= y <= SCREEN_H + 4:
+                    pygame.draw.circle(self.screen, SKID_COL, (x, y), 2)
+        if len(self._trail) > 1:
+            pts = self._to_screen(np.array(self._trail, dtype=float))
+            overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            n = len(pts) - 1
+            for i in range(n):
+                a = int(30 + 170 * (i + 1) / n)   # newest brightest, older fades out
+                pygame.draw.line(overlay, (*TRAIL_COL, a), pts[i], pts[i + 1], 2)
+            self.screen.blit(overlay, (0, 0))
 
     def _draw_hud(self, info: dict) -> None:
         draw_hud(self.screen, self.font, self.big, info)
@@ -201,6 +254,7 @@ def draw_hud(screen, font, big, info: dict) -> None:
 
     _draw_sectors(screen, info)
     _draw_telemetry(screen, info)
+    _draw_racing_telemetry(screen, info)
 
     if not info.get("lap_valid", True):
         _draw_banner(screen, big, "LAP INVALID", WARN)
@@ -315,6 +369,87 @@ def _draw_telemetry(screen, info: dict) -> None:
         pygame.draw.rect(screen, STEER_COL, pygame.Rect(lo, sb_y, hi - lo, sb_h), border_radius=7)
     pygame.draw.line(screen, HUD, (cx, sb_y - 1), (cx, sb_y + sb_h + 1), 1)
     pygame.draw.circle(screen, HUD, (pos, sb_y + sb_h // 2), 6)
+
+
+# --- racing telemetry cluster (gear/RPM tach, tyre grip, friction circle) ------
+REDLINE_RPM = 8200.0      # matches CarParams.redline_rpm
+SHIFT_RPM = 7800.0        # matches CarParams.shift_up_rpm (tach redline zone)
+SLIP_PEAK = math.radians(6.5)   # slip angle at grip peak; beyond ≈ sliding
+SPIN_PEAK = 0.18                # rear slip ratio at grip peak; beyond ≈ wheelspin
+G_SCALE = 1.6                   # friction-circle full-scale (g)
+GRIP_OK = (110, 200, 130)
+GRIP_WARN = (236, 200, 92)
+GRIP_OVER = (236, 96, 84)
+RPM_COL = (120, 180, 235)
+
+
+def _grip_color(load: float):
+    return GRIP_OVER if load >= 1.0 else GRIP_WARN if load >= 0.8 else GRIP_OK
+
+
+def _draw_racing_telemetry(screen, info: dict) -> None:
+    """Bottom-left instruments straight from the car physics: gear + RPM tach,
+    front/rear tyre grip bars (green→red as a tyre nears/exceeds its grip limit, so
+    you see understeer/oversteer/wheelspin), and a friction-circle g-meter."""
+    w, h, pad = 286, 122, 12
+    x0, y0 = 16, SCREEN_H - 44 - h
+    pygame.draw.rect(screen, CARD_BG, pygame.Rect(x0, y0, w, h), border_radius=14)
+    ix, iy = x0 + pad, y0 + pad
+    f_lbl = _get_font(12)
+    f_big = _get_font(32, bold=True)
+    f_sm = _get_font(12, bold=True)
+    circle_d = 86
+    left_w = w - pad * 3 - circle_d
+
+    # GEAR (big) + RPM tach to its right.
+    gear = int(info.get("gear", 0)) + 1
+    screen.blit(f_lbl.render("GEAR", True, LABEL), (ix, iy))
+    screen.blit(f_big.render(str(gear), True, HUD), (ix, iy + 11))
+    gw = 30
+    tx, ty, tw, th = ix + gw + 6, iy + 4, left_w - gw - 6, 11
+    pygame.draw.rect(screen, TRACK_BG, pygame.Rect(tx, ty, tw, th), border_radius=6)
+    rpm = float(info.get("rpm", 0.0))
+    fw = int(tw * min(rpm / REDLINE_RPM, 1.0))
+    if fw > 0:
+        pygame.draw.rect(screen, GRIP_OVER if rpm >= SHIFT_RPM else RPM_COL,
+                         pygame.Rect(tx, ty, fw, th), border_radius=6)
+    rl_x = tx + int(tw * SHIFT_RPM / REDLINE_RPM)
+    pygame.draw.line(screen, GRIP_OVER, (rl_x, ty - 1), (rl_x, ty + th + 1), 2)
+    screen.blit(f_lbl.render(f"{rpm:>4.0f} rpm", True, HUD_DIM), (tx, ty + th + 3))
+
+    # Tyre grip bars — rear load is the worse of slip-angle and wheelspin.
+    fl = abs(float(info.get("slip_f", 0.0))) / SLIP_PEAK
+    rr = max(abs(float(info.get("slip_r", 0.0))) / SLIP_PEAK,
+             abs(float(info.get("slip_ratio", 0.0))) / SPIN_PEAK)
+    bx, bw = ix + 16, left_w - 16
+    for k, (lab, load) in enumerate((("F", fl), ("R", rr))):
+        ry = iy + 52 + k * 22
+        screen.blit(f_sm.render(lab, True, LABEL), (ix, ry))
+        pygame.draw.rect(screen, TRACK_BG, pygame.Rect(bx, ry, bw, 13), border_radius=6)
+        bw_fill = int(bw * min(load, 1.0))
+        col = _grip_color(load)
+        if bw_fill > 0:
+            pygame.draw.rect(screen, col, pygame.Rect(bx, ry, bw_fill, 13), border_radius=6)
+        if load >= 1.0:
+            s = f_sm.render("SLIP", True, GRIP_OVER)
+            screen.blit(s, (bx + bw - s.get_width() - 4, ry))
+
+    # Friction-circle g-meter: a dot at (lateral, longitudinal) g; out to the ring
+    # = at the limit. Inner ring = 1 g. Dot reddens as combined g rises.
+    cx, cy = x0 + w - pad - circle_d // 2, y0 + pad + circle_d // 2
+    R = circle_d // 2
+    pygame.draw.circle(screen, TRACK_BG, (cx, cy), R)
+    pygame.draw.circle(screen, HUD_DIM, (cx, cy), R, 1)
+    pygame.draw.circle(screen, (72, 76, 86), (cx, cy), max(int(R / G_SCALE), 2), 1)
+    pygame.draw.line(screen, (72, 76, 86), (cx - R, cy), (cx + R, cy), 1)
+    pygame.draw.line(screen, (72, 76, 86), (cx, cy - R), (cx, cy + R), 1)
+    lat, lon = float(info.get("lat_g", 0.0)), float(info.get("long_g", 0.0))
+    dx = int(np.clip(lat / G_SCALE, -1.0, 1.0) * R)
+    dy = int(np.clip(lon / G_SCALE, -1.0, 1.0) * R)
+    gmag = math.hypot(lat, lon)
+    pygame.draw.circle(screen, _grip_color(gmag / 1.1), (cx + dx, cy - dy), 5)
+    gs = f_lbl.render(f"{gmag:.1f}g", True, HUD)
+    screen.blit(gs, (cx - gs.get_width() // 2, cy + R - 13))
 
 
 MINIMAP_SIZE = 170

@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import math
 import os
+import random
+from collections import deque
 
 import numpy as np
 import pygame
 
 from .car import Car, CarParams
-from .render import SCREEN_H, SCREEN_W, draw_hud, draw_minimap
+from .render import SCREEN_H, SCREEN_W, SLIP_PEAK, SPIN_PEAK, draw_hud, draw_minimap
 from .track import Track
 
 # Camera rig (metres / radians).
@@ -190,6 +192,14 @@ class HoodCamRenderer:
         # meet it every frame, so we just track its current value.
         self._horizon_y = self.horizon_y
 
+        # Screen FX: a speed vignette (edges darken as you go faster) and a red brake
+        # glow, built once as radial per-pixel-alpha overlays and blitted at a
+        # speed/brake-scaled strength each frame. Plus rising tyre-smoke puffs when a
+        # tyre breaks traction.
+        self._vignette = _radial_overlay((6, 7, 10))
+        self._brakeglow = _radial_overlay((170, 32, 26))
+        self._smoke: deque = deque(maxlen=48)
+
         self.show_beams = True  # draw the agent's rangefinder beams (toggle: B in play.py)
         self._cam = np.zeros(3)
         self._fwd = np.array([1.0, 0.0, 0.0])
@@ -357,9 +367,9 @@ class HoodCamRenderer:
         for i in order:
             j = nxt[i]
             if ld[i] > NEAR and ld[j] > NEAR:
-                pygame.draw.line(self.screen, LIMIT, tuple(ls[i]), tuple(ls[j]), 2)
+                pygame.draw.aaline(self.screen, LIMIT, tuple(ls[i]), tuple(ls[j]))  # AA: crisper edge
             if rd[i] > NEAR and rd[j] > NEAR:
-                pygame.draw.line(self.screen, LIMIT, tuple(rs[i]), tuple(rs[j]), 2)
+                pygame.draw.aaline(self.screen, LIMIT, tuple(rs[i]), tuple(rs[j]))
 
         # Start/finish line across the track.
         if ld[0] > NEAR and rd[0] > NEAR:
@@ -369,6 +379,7 @@ class HoodCamRenderer:
             self._draw_beams(car, beam_angles, info)
 
         self._draw_hood()
+        self._draw_speed_fx(info)
         draw_hud(self.screen, self.font, self.big, info)
         draw_minimap(self.screen, self.track, car, info)
 
@@ -659,8 +670,68 @@ class HoodCamRenderer:
         pygame.draw.polygon(self.screen, HOOD, hood)
         pygame.draw.line(self.screen, HOOD_SHINE, (w * 0.5, h), (w * 0.5, h - 86), 2)
 
+    def _draw_speed_fx(self, info: dict) -> None:
+        """Speed vignette + brake glow + tyre smoke — drawn over the world, under the
+        HUD, so the instruments stay crisp on top."""
+        speed = float(info.get("speed", 0.0))
+        k = min(speed / 75.0, 1.0)              # ~270 km/h ≈ full vignette
+        if k > 0.02:
+            v = self._vignette.copy()
+            v.fill((255, 255, 255, int(255 * 0.5 * k)), special_flags=pygame.BLEND_RGBA_MULT)
+            self.screen.blit(v, (0, 0))
+        brake = float(info.get("brake_app", 0.0))
+        if brake > 0.05:
+            g = self._brakeglow.copy()
+            g.fill((255, 255, 255, int(255 * 0.5 * min(brake, 1.0))), special_flags=pygame.BLEND_RGBA_MULT)
+            self.screen.blit(g, (0, 0))
+        self._draw_smoke(info)
+
+    def _draw_smoke(self, info: dict) -> None:
+        """Translucent puffs that rise from the lower edge when a tyre breaks traction."""
+        slide = max(abs(info.get("slip_r", 0.0)) / SLIP_PEAK,
+                    abs(info.get("slip_ratio", 0.0)) / SPIN_PEAK,
+                    abs(info.get("slip_f", 0.0)) / SLIP_PEAK)
+        if slide > 1.05 and info.get("speed", 0.0) > 4.0:
+            for _ in range(2):
+                x = SCREEN_W * (0.5 + random.uniform(-0.26, 0.26))
+                y = SCREEN_H - random.uniform(0.0, 40.0)
+                self._smoke.append([x, y, 0.0, random.uniform(14.0, 26.0)])
+        if not self._smoke:
+            return
+        alive = []
+        for px, py, age, rad in self._smoke:
+            age += 0.045
+            if age >= 1.0:
+                continue
+            py -= 1.8            # rise
+            rad += 0.9           # billow out
+            a = int(110 * (1.0 - age))
+            d = int(rad * 2)
+            puff = pygame.Surface((d, d), pygame.SRCALPHA)
+            pygame.draw.circle(puff, (205, 206, 210, a), (int(rad), int(rad)), int(rad))
+            self.screen.blit(puff, (px - rad, py - rad))
+            alive.append([px, py, age, rad])
+        self._smoke = deque(alive, maxlen=48)
+
     def close(self) -> None:
         pygame.quit()
+
+
+def _radial_overlay(color: tuple) -> pygame.Surface:
+    """A full-screen per-pixel-alpha overlay of `color`: transparent in the centre,
+    ramping opaque toward the edges. Reused for the speed vignette and brake glow."""
+    yy, xx = np.mgrid[0:SCREEN_H, 0:SCREEN_W]
+    cx, cy = SCREEN_W / 2.0, SCREEN_H * 0.52
+    d = np.sqrt(((xx - cx) / (SCREEN_W * 0.60)) ** 2 + ((yy - cy) / (SCREEN_H * 0.60)) ** 2)
+    a = (np.clip((d - 0.45) / 0.55, 0.0, 1.0) ** 1.6 * 255).astype(np.uint8)
+    surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    rgb = pygame.surfarray.pixels3d(surf)
+    rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2] = color
+    del rgb
+    al = pygame.surfarray.pixels_alpha(surf)
+    al[:, :] = a.T
+    del al
+    return surf
 
 
 def _tree_layers(rng) -> list:

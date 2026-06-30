@@ -26,9 +26,9 @@ def main() -> None:
                          "corner_brake term in the --viz reward breakdown (0 to hide it)")
     ap.add_argument("--stochastic", action="store_true", help="sample actions instead of using the mean")
     ap.add_argument("--viz", action="store_true", help="open a separate window visualising the model's activations")
-    ap.add_argument("--smooth-steer", type=float, default=0.6, metavar="A",
-                    help="EMA-smooth the steering output to kill jitter from noisy long-range beams "
-                         "(0 = raw policy, ~0.6 = stable, higher = smoother but laggier)")
+    ap.add_argument("--smooth-steer", type=float, default=0.75, metavar="A",
+                    help="EMA-smooth the steering output to absorb input spikes when beams change fast "
+                         "(0 = raw policy, 0.75 = steady default, ~0.85-0.9 = very smooth but laggier)")
     args = ap.parse_args()
 
     import pygame

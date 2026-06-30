@@ -183,6 +183,8 @@ class RacingEnv(gym.Env):
 
         # Per-lap timing state (wiped by reset / restage).
         self._steps = 0
+        self._prev_vx = 0.0   # previous forward speed, for the longitudinal-g telemetry
+        self._long_g = 0.0    # last longitudinal g (accel +, brake -), for the HUD g-meter
         self._prev_s = 0.0
         self._lap_progress = 0.0  # unwrapped distance travelled along the track
         self._lap_start_step = 0
@@ -254,6 +256,8 @@ class RacingEnv(gym.Env):
             lo, hi = self.spawn_speed
             self.car.rolling_start(float(self.np_random.uniform(lo, hi)))
         self._last_action = (0.0, 0.0)  # no phantom action-delta on the first tick
+        self._prev_vx = self.car.s.vx   # seed from spawn speed so first-frame long_g isn't a spike
+        self._long_g = 0.0
         self._beam_dist = None  # fresh start: no carry-over smoothing from last episode
         self._update_beams()
         self._steps = 0
@@ -291,6 +295,9 @@ class RacingEnv(gym.Env):
         grip_mult = self.off_track_grip if on_grass else 1.0
         rolling_mult = self.off_track_rolling if on_grass else 1.0
         self.car.step(steer, throttle, self.dt, grip_mult=grip_mult, rolling_mult=rolling_mult)
+        # Longitudinal g from the speed change this tick (for the HUD friction circle).
+        self._long_g = (self.car.s.vx - self._prev_vx) / self.dt / 9.81
+        self._prev_vx = self.car.s.vx
         self._steps += 1
         self._update_beams()  # cast + EMA-smooth the rangefinders for this tick
 
@@ -565,6 +572,17 @@ class RacingEnv(gym.Env):
             "steer_cmd": self._last_action[0],
             "throttle_app": max(self._last_action[1], 0.0),
             "brake_app": max(-self._last_action[1], 0.0),
+            # Live physics telemetry for the racing HUD (gear/rpm tach, per-axle tyre
+            # grip/slip bars, friction-circle g-meter) — data the sim already computes.
+            "gear": s.gear,
+            "rpm": s.engine_rpm,
+            "slip_f": s.slip_f,                 # front slip angle (rad)
+            "slip_r": s.slip_r,                 # rear slip angle (rad)
+            "slip_ratio": (s.wheel_v_r - s.vx) / max(abs(s.vx), self.car.p.slip_vx_floor),  # rear wheelspin
+            "beta": math.atan2(s.vy, abs(s.vx) + 1e-3),  # vehicle sideslip (rad)
+            "lat_g": s.vx * s.r / 9.81,         # lateral (centripetal) g
+            "long_g": self._long_g,             # longitudinal g (accel/brake), tracked in step()
+            "vy": s.vy,
         }
 
 
